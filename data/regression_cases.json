@@ -1,0 +1,208 @@
+[
+  {
+    "id": "chitchat_01",
+    "category": "闲聊",
+    "query": "你好",
+    "expect": { "route": "chitchat", "strategy": "fixed" }
+  },
+  {
+    "id": "chitchat_02",
+    "category": "闲聊",
+    "query": "在吗",
+    "expect": { "route": "chitchat", "strategy": "fixed" }
+  },
+  {
+    "id": "chitchat_03",
+    "category": "闲聊",
+    "query": "谢谢",
+    "expect": { "route": "chitchat", "strategy": "fixed" }
+  },
+  {
+    "id": "handoff_01",
+    "category": "转人工",
+    "query": "转人工",
+    "expect": { "route": "handoff", "strategy": "fixed" }
+  },
+  {
+    "id": "handoff_02",
+    "category": "转人工",
+    "query": "我要投诉",
+    "expect": { "route": "handoff", "strategy": "fixed" }
+  },
+  {
+    "id": "sensitive_01",
+    "category": "敏感词",
+    "query": "怎么代开发票",
+    "expect": { "route": "sensitive", "strategy": "fixed" }
+  },
+  {
+    "id": "faq_direct_01",
+    "category": "FAQ直出",
+    "query": "如何修改收货地址？",
+    "expect": { "route": "faq", "strategy": "direct", "faq_id": "faq_001" }
+  },
+  {
+    "id": "faq_direct_02",
+    "category": "FAQ直出",
+    "query": "收货地址能改吗",
+    "expect": { "route": "faq", "strategy": "direct", "faq_id": "faq_001" }
+  },
+  {
+    "id": "faq_direct_03",
+    "category": "FAQ直出",
+    "query": "支持哪些支付方式？",
+    "expect": { "route": "faq", "strategy": "direct", "faq_id": "faq_002" }
+  },
+  {
+    "id": "faq_direct_04",
+    "category": "FAQ直出",
+    "query": "退货几天",
+    "expect": { "route": "faq", "strategy": "direct", "faq_id": "faq_009" }
+  },
+  {
+    "id": "faq_direct_05",
+    "category": "FAQ直出",
+    "query": "退款多久到账",
+    "expect": { "route": "faq", "strategy": "direct", "faq_id": "faq_011" }
+  },
+  {
+    "id": "faq_direct_06",
+    "category": "FAQ直出",
+    "query": "基础版多少钱",
+    "expect": { "route": "faq", "strategy": "direct", "faq_id": "faq_014" }
+  },
+  {
+    "id": "faq_direct_07",
+    "category": "FAQ直出",
+    "query": "客服工作时间",
+    "expect": { "route": "faq", "strategy": "direct", "faq_id": "faq_008" }
+  },
+  {
+    "id": "faq_direct_08",
+    "category": "FAQ直出",
+    "query": "忘记密码怎么办",
+    "expect": { "route": "faq", "strategy": "direct", "faq_id": "faq_005" }
+  },
+  {
+    "id": "manual_01",
+    "category": "手册",
+    "query": "门禁通行怎么用",
+    "expect": { "route": "manual" },
+    "check": "route_only"
+  },
+  {
+    "id": "manual_02",
+    "category": "手册",
+    "query": "访客预约怎么操作",
+    "expect": { "route": "manual" },
+    "check": "route_only"
+  },
+  {
+    "id": "manual_03",
+    "category": "手册",
+    "query": "业务认证怎么弄",
+    "expect": { "route": "manual" },
+    "check": "route_only"
+  },
+  {
+    "id": "context_01",
+    "category": "会话上下文",
+    "query": "那个怎么弄",
+    "history": [
+      { "role": "user", "content": "门禁通行怎么用" },
+      { "role": "assistant", "content": "门禁通行可在应用内按步骤完成刷卡或二维码通行。" }
+    ],
+    "expect": { "route": "manual" },
+    "check": "route_only"
+  },
+  {
+    "id": "context_02",
+    "category": "会话上下文",
+    "query": "怎么弄",
+    "last_topic": "门禁通行",
+    "expect": { "route": "manual" },
+    "check": "route_only"
+  },
+  {
+    "id": "reject_01",
+    "category": "拒识",
+    "query": "今天月球天气怎么样",
+    "expect": { "route": "none", "strategy": "reject" }
+  },
+  {
+    "id": "reject_02",
+    "category": "拒识",
+    "query": "帮我写一首关于量子力学的诗",
+    "expect": { "route": "none", "strategy": "reject" }
+  },
+  {
+    "id": "handoff_auto_no_answer",
+    "category": "转人工",
+    "turns": [
+      {
+        "query": "今天月球天气怎么样",
+        "expect": { "route": "none", "strategy": "reject" }
+      },
+      {
+        "query": "帮我写一首关于量子力学的诗",
+        "expect": { "route": "none", "strategy": "reject" }
+      },
+      {
+        "query": "火星上有没有咖啡店",
+        "expect": { "route": "handoff", "strategy": "auto_no_answer" }
+      }
+    ]
+  },
+  {
+    "id": "handoff_auto_repeat",
+    "category": "转人工",
+    "turns": [
+      {
+        "query": "今天月球天气怎么样",
+        "expect": { "route": "none", "strategy": "reject" }
+      },
+      {
+        "query": "今天月球天气怎么样",
+        "expect": { "route": "none", "strategy": "reject" }
+      },
+      {
+        "query": "今天月球天气怎么样？",
+        "expect": { "route": "handoff", "strategy": "auto_repeat" }
+      }
+    ]
+  },
+  {
+    "id": "flow_order_01",
+    "category": "多轮流程",
+    "turns": [
+      {
+        "query": "帮我查一下物流",
+        "expect": { "route": "flow", "strategy": "order_slot" }
+      },
+      {
+        "query": "ORD10001",
+        "expect": {
+          "route": "flow",
+          "strategy": "order_result",
+          "answer_contains": "ORD10001"
+        }
+      }
+    ]
+  },
+  {
+    "id": "flow_order_02",
+    "category": "多轮流程",
+    "query": "查订单 ORD10002",
+    "expect": {
+      "route": "flow",
+      "strategy": "order_result",
+      "answer_contains": "已签收"
+    }
+  },
+  {
+    "id": "faq_or_clarify_01",
+    "category": "FAQ",
+    "query": "地址",
+    "expect": { "route": "faq", "strategy_in": ["direct", "clarify"] }
+  }
+]

@@ -1,0 +1,44 @@
+[project]
+name = "replykit"
+version = "0.1.0"
+description = "ReplyKit — 智能客服 Agent（通义 + RAG）"
+license = { text = "MIT" }
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "langchain>=0.2.17,<0.3",
+    "langchain-openai>=0.1.25,<0.2",
+    "langchain-community>=0.2.19,<0.3",
+    "langchain-text-splitters>=0.2.4,<0.3",
+    "qdrant-client>=1.15.0",
+    "python-dotenv>=1.0.0",
+    "openai>=1.0.0",
+    "python-docx>=1.1.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "xlwt>=1.3.0",
+    "openpyxl>=3.1.0",
+    "xlrd>=2.0.0",
+    "python-multipart>=0.0.9",
+    "pycryptodome>=3.20.0",
+    "PyJWT>=2.8.0",
+    "bcrypt>=4.0.0",
+]
+
+[project.scripts]
+replykit = "main:main"
+replykit-api = "src.api:main"
+replykit-regression = "src.regression:main"
+replykit-export-logs = "src.chat_log:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"main.py" = "main.py"
+
+[tool.uv]
+package = true

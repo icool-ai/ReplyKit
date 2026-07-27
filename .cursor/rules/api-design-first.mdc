@@ -1,0 +1,52 @@
+---
+description: 写接口前先确认参数/返回结构，并按 RESTful 规范设计
+alwaysApply: true
+---
+
+# 接口设计先行（Design First）
+
+新增、修改 HTTP 接口时，**禁止直接写代码**。须先输出设计草案，等用户明确确认后再实现。
+
+## 确认前必须给出的草案
+
+用简洁表格/列表说明：
+
+1. **接口概要**：Method + Path、一句话用途
+2. **请求参数**：位置（path / query / body / header）、名称、类型、是否必填、含义、示例
+3. **返回结构**：字段名、类型、含义；与现有统一信封对齐
+4. **错误与状态码**：主要失败场景对应的 HTTP status 与业务 `code`
+
+用户回复确认（如「没问题」「可以写」）之前，只讨论设计，不改接口实现文件。
+
+## RESTful 约定（仅 POST）
+
+- **只使用 `GET`、`POST`**，不使用 `PUT` / `PATCH` / `DELETE`
+- `GET`：查询、列表、导出等只读操作（安全、幂等）
+- `POST`：创建、更新、删除、以及所有有副作用或带复杂 body 的写操作
+- 资源用名词复数：`/chat/logs`、`/metrics`；更新/删除用 POST + 子路径表达意图，如 `POST /faqs`（创建）、`POST /faqs/{id}/update`、`POST /faqs/{id}/delete`
+- 路径参数标识资源：`/tickets/{ticket_id}`；过滤/分页用 query：`?limit=20&offset=0`
+- 避免动词路径（如 `/getLogs`）；查询用 GET + 资源路径即可
+
+## 与本项目对齐
+
+- JSON 统一信封：`{ "code", "message", "data" }`（见 `src/api_response.py`）
+- 文件下载等二进制响应可例外，但须在草案中标明
+- 鉴权：`Authorization: Bearer <JWT>`（先 `POST /auth/login`；JWT 含 `sub`/`role`）
+- 角色：`user`（自助注册）/ `ops`（运营，种子管理员或用户管理开户）；公开端点须在草案中注明；不再使用 `X-API-Key`
+
+## 草案示例（格式参考）
+
+```
+POST /chat
+用途：发送用户消息并返回客服回复
+
+请求（body）
+| 参数 | 类型 | 必填 | 含义 |
+| message | string | 是 | 用户输入 |
+| session_id | string | 否 | 续聊会话 ID |
+
+响应 data
+| 字段 | 类型 | 含义 |
+| session_id | string | 会话 ID |
+| answer | string | 回复正文 |
+```
