@@ -476,11 +476,11 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             "鉴权：POST /auth/login 换 JWT（含 role）；"
             "Authorization: Bearer <access_token>。"
             "公开：/health、企微回调、/auth/login、/auth/register、/auth/refresh。"
-            "普通用户：/chat、/sessions*；"
-            "运营 ops：/faqs*、/sensitive-words*、/bot-scripts*、/users*。"
+            "普通用户：/chat、/sessions*、GET /bot-scripts；"
+            "运营 ops：/faqs*、/sensitive-words*、POST /bot-scripts*、/users*。"
             "POST /chat；GET /sessions；"
             "POST /faqs、/faqs/list…；POST /users、/users/list、/users/update、/users/reset-password；"
-            "GET/POST /bot-scripts*。"
+            "GET /bot-scripts（登录可读）；POST /bot-scripts*（ops）。"
         ),
     )
     # 本地 Vue(Vite) 直连 API 时用；开发默认走 Vite proxy，生产建议同源反向代理
@@ -1136,7 +1136,7 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/bot-scripts", response_model=ApiResponse[BotScriptsData])
     def bot_scripts_get(
-        _: dict[str, Any] = Depends(require_ops),
+        _: dict[str, Any] = Depends(require_auth),
     ) -> dict[str, Any]:
         try:
             data = get_bot_scripts()
