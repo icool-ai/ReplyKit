@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { nextTick, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { getBotScripts } from '@/api/botScripts'
 import { postChat } from '@/api/chat'
 import { ApiError } from '@/api/client'
 import { deleteSession, getSession, listSessions, type SessionSummary } from '@/api/sessions'
@@ -19,11 +20,35 @@ const messages = ref<Bubble[]>([])
 const listRef = ref<HTMLElement | null>(null)
 const history = ref<SessionSummary[]>([])
 const historyLoading = ref(false)
+const welcomeText = ref('')
+/** 视图世代：作废过期的欢迎语 / 打开会话回调，避免异步回写互相覆盖 */
+let viewEpoch = 0
 
 async function scrollBottom() {
   await nextTick()
   const el = listRef.value
   if (el) el.scrollTop = el.scrollHeight
+}
+
+async function ensureWelcomeText(): Promise<string> {
+  if (welcomeText.value) return welcomeText.value
+  try {
+    const data = await getBotScripts()
+    welcomeText.value = (data.welcome || '').trim()
+  } catch {
+    welcomeText.value = ''
+  }
+  return welcomeText.value
+}
+
+async function showWelcome() {
+  const epoch = ++viewEpoch
+  const text = await ensureWelcomeText()
+  if (epoch !== viewEpoch) return
+  if (sessionId.value !== null) return
+  if (messages.value.some((m) => m.role === 'user')) return
+  messages.value = text ? [{ role: 'assistant', content: text }] : []
+  await scrollBottom()
 }
 
 async function loadHistory() {
@@ -39,8 +64,10 @@ async function loadHistory() {
 }
 
 async function openSession(item: SessionSummary) {
+  const epoch = ++viewEpoch
   try {
     const detail = await getSession(item.session_id)
+    if (epoch !== viewEpoch) return
     sessionId.value = detail.session_id
     messages.value = detail.messages.map((m) => ({
       role: m.role === 'user' ? 'user' : 'assistant',
@@ -48,6 +75,7 @@ async function openSession(item: SessionSummary) {
     }))
     await scrollBottom()
   } catch (err) {
+    if (epoch !== viewEpoch) return
     ElMessage.error(err instanceof ApiError ? err.message : '打开会话失败')
   }
 }
@@ -57,7 +85,7 @@ async function removeSession(item: SessionSummary, e: Event) {
   try {
     await ElMessageBox.confirm(`删除会话「${item.title}」？`, '确认删除', { type: 'warning' })
     await deleteSession(item.session_id)
-    if (sessionId.value === item.session_id) resetSession(false)
+    if (sessionId.value === item.session_id) await resetSession(false)
     await loadHistory()
     ElMessage.success('已删除')
   } catch (err) {
@@ -70,6 +98,7 @@ async function send(text?: string) {
   const message = (text ?? input.value).trim()
   if (!message || loading.value) return
 
+  viewEpoch += 1
   messages.value.push({ role: 'user', content: message })
   if (!text) input.value = ''
   loading.value = true
@@ -99,14 +128,17 @@ function onClarify(option: string) {
   void send(option)
 }
 
-function resetSession(notify = true) {
+async function resetSession(notify = true) {
   sessionId.value = null
+  welcomeText.value = ''
   messages.value = []
+  await showWelcome()
   if (notify) ElMessage.success('已开启新会话')
 }
 
 onMounted(() => {
   void loadHistory()
+  void showWelcome()
 })
 </script>
 
