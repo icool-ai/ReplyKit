@@ -40,6 +40,7 @@ class Settings:
     chat_log_db_path: Path
     faq_db_path: Path
     sensitive_db_path: Path
+    channels_db_path: Path
     top_k: int
     clarify_threshold: float
     direct_threshold: float
@@ -145,6 +146,12 @@ class Settings:
         if not sensitive_db_path.is_absolute():
             sensitive_db_path = PROJECT_ROOT / sensitive_db_path
 
+        channels_db_path = Path(
+            os.getenv("CHANNELS_DB_PATH", "./data/channels.db")
+        )
+        if not channels_db_path.is_absolute():
+            channels_db_path = PROJECT_ROOT / channels_db_path
+
         # Prefer CLARIFY_THRESHOLD; fall back to legacy SCORE_THRESHOLD.
         clarify = float(
             os.getenv("CLARIFY_THRESHOLD")
@@ -187,6 +194,7 @@ class Settings:
             chat_log_db_path=chat_log_db_path,
             faq_db_path=faq_db_path,
             sensitive_db_path=sensitive_db_path,
+            channels_db_path=channels_db_path,
             top_k=int(os.getenv("TOP_K", "4")),
             clarify_threshold=clarify,
             direct_threshold=direct,

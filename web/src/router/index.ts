@@ -47,6 +47,12 @@ const router = createRouter({
           meta: { title: '话术配置', ops: true },
         },
         {
+          path: 'channels',
+          name: 'channels',
+          component: () => import('@/views/ChannelsView.vue'),
+          meta: { title: '渠道配置' },
+        },
+        {
           path: 'users',
           name: 'users',
           component: () => import('@/views/UsersView.vue'),
