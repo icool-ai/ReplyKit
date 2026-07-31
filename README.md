@@ -23,8 +23,8 @@ FAQ 管理：
 - **对话**：意图识别 → FAQ 检索 → 直出 / 澄清 / LLM 润色
 - **知识库**：FAQ 增删改、导入（JSON / CSV / TXT / Excel）、重建向量库
 - **运营**：敏感词、话术配置、用户管理（JWT：`user` / `ops`）
-- **前端**：对话页、FAQ / 敏感词 / 话术 / 用户管理（`web/`）
-- **可选**：企业微信自建应用回调（`/webhooks/wecom`）
+- **可选**：企业微信回调；飞书事件回调 + 任务中心「我负责的」查询（需用户 OAuth）
+- **前端**：对话页、FAQ / 敏感词 / 话术 / 用户管理 / 渠道配置（`web/`）
 
 ## 页面
 
@@ -124,6 +124,29 @@ POST /faqs/import
 1. `POST /auth/login` 获取 JWT
 2. 请求头：`Authorization: Bearer <access_token>`
 3. 角色：`user`（可自助注册，由 `AUTH_ALLOW_REGISTER` 控制）/ `ops`（运营）
+
+## 飞书任务查询（可选）
+
+在飞书对机器人说自然语言即可查询任务中心（仅限**当前授权用户有权限看到**的数据）：
+
+- 「我有哪些未完成的任务」→ 我负责的
+- 「所有任务 / 不是我负责的」→ 你有权限看到的全部任务（不限执行人）
+- 「帮我看看辰子任务情况」→ 按成员（意图 LLM 抽人名 + 搜人）
+- 「查一下张三的未完成任务」→ 按成员（search + assignee）
+- 「有哪些清单」→ 可读任务清单
+- 「看看【项目A】清单 / 看板」→ 清单任务或按分组（看板列）汇总
+- 「看看现在有哪些任务」（未指明范围）→ 先澄清再查
+
+任务子类型优先由意图模型输出的 `task_scope` / `person_name` 等槽位决定；模型失败时回退关键词规则。
+
+配置步骤：
+
+1. 开放平台开通并发布：`task:task:read`、`task:tasklist:read`、`task:section:read`、`contact:user:search`、`offline_access`
+2. `.env` 配置公网 `ASSET_BASE_URL`；重定向 URL 填 `{ASSET_BASE_URL}/oauth/feishu/callback`
+3. 首次查询点授权链接；**权限升级后需重新授权一次**
+4. 网页 `/chat` 触发同类意图时会提示去飞书使用（无飞书身份）
+
+无法查看你无权访问的他人私密任务。
 
 ## License
 

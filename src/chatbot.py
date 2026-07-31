@@ -22,6 +22,7 @@ from src.context import (
     resolve_search_query,
     topic_from_docs,
 )
+from src.flow_feishu_task import FeishuTaskFlow
 from src.flow_order import OrderQueryFlow
 from src.flow_ticket import TicketCreateFlow
 from src.handoff import (
@@ -252,6 +253,8 @@ class CustomerServiceBot:
         self.last_user_norm: str = ""
         self.order_flow = OrderQueryFlow()
         self.ticket_flow = TicketCreateFlow()
+        self.feishu_task_flow = FeishuTaskFlow()
+        self.channel_ctx = None  # set/cleared by API under bot_lock
         configure_business_db(settings.business_db_path)
         self._ensure_vectorstore()
 
@@ -264,6 +267,8 @@ class CustomerServiceBot:
         self.last_user_norm = ""
         self.order_flow.reset()
         self.ticket_flow.reset()
+        self.feishu_task_flow.reset()
+        self.channel_ctx = None
 
     def dump_session(self) -> dict:
         """Snapshot mutable session fields (for multi-session API)."""
@@ -276,6 +281,7 @@ class CustomerServiceBot:
             "last_user_norm": self.last_user_norm,
             "order_flow_state": self.order_flow.state,
             "ticket_flow_state": self.ticket_flow.state,
+            "feishu_task_flow": self.feishu_task_flow.dump(),
         }
 
     def load_session(self, data: dict | None) -> None:
@@ -302,9 +308,28 @@ class CustomerServiceBot:
             if ticket_state in {"idle", "waiting_description"}
             else "idle"
         )
+        ft = data.get("feishu_task_flow")
+        if isinstance(ft, dict):
+            self.feishu_task_flow.load(ft)
+        else:
+            self.feishu_task_flow.reset()
 
     def _try_active_flows(self, user_message: str):
-        """Continue in-progress order/ticket flows only."""
+        """Continue in-progress order/ticket/feishu-task flows only."""
+        if self.feishu_task_flow.state != "idle":
+            flow = self.feishu_task_flow.handle(
+                user_message,
+                channel_ctx=self.channel_ctx,
+                public_base=(
+                    getattr(self.channel_ctx, "public_base", "")
+                    if self.channel_ctx
+                    else ""
+                )
+                or (self.settings.asset_base_url or ""),
+                channels_db_path=self.settings.channels_db_path,
+            )
+            if flow.handled:
+                return flow, "feishu_task_query", self.feishu_task_flow.state
         if self.ticket_flow.state != "idle":
             flow = self.ticket_flow.handle(user_message)
             if flow.handled:
@@ -323,6 +348,19 @@ class CustomerServiceBot:
         flow = self.ticket_flow.handle(user_message)
         if flow.handled:
             return flow, "ticket_create", self.ticket_flow.state
+        flow = self.feishu_task_flow.handle(
+            user_message,
+            channel_ctx=self.channel_ctx,
+            public_base=(
+                getattr(self.channel_ctx, "public_base", "")
+                if self.channel_ctx
+                else ""
+            )
+            or (self.settings.asset_base_url or ""),
+            channels_db_path=self.settings.channels_db_path,
+        )
+        if flow.handled:
+            return flow, "feishu_task_query", self.feishu_task_flow.state
         return None, "", ""
 
     def _try_task_flows(self, user_message: str):
@@ -775,10 +813,20 @@ class CustomerServiceBot:
             )
             if intent.ok:
                 route_name = route_from_intent(intent)
-                intent_lines = [
-                    f"  - {it.type} q={it.search_query!r} conf={it.confidence:.2f}"
-                    for it in intent.intents
-                ]
+                intent_lines = []
+                for it in intent.intents:
+                    line = (
+                        f"  - {it.type} q={it.search_query!r} "
+                        f"conf={it.confidence:.2f}"
+                    )
+                    if it.type == "feishu_task_query" and it.task_scope:
+                        line += (
+                            f" scope={it.task_scope}"
+                            f" person={it.person_name!r}"
+                            f" list={it.tasklist_name!r}"
+                            f" completed={it.completed!r}"
+                        )
+                    intent_lines.append(line)
                 _log(
                     "意图识别",
                     f"primary={intent.primary} route={route_name}\n"
@@ -791,6 +839,7 @@ class CustomerServiceBot:
                     history=history,
                     intent=intent,
                     route_name=route_name,
+                    channel_ctx=self.channel_ctx,
                 )
                 result = dispatch_intent_route(ctx)
                 self._log_skill_result(result)
@@ -806,6 +855,7 @@ class CustomerServiceBot:
             user_message=user_message,
             dialogue=dialogue,
             history=history,
+            channel_ctx=self.channel_ctx,
         )
         result = dispatch_legacy_route(ctx)
         self._log_skill_result(result)

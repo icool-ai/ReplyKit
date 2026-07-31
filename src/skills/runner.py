@@ -78,7 +78,7 @@ def dispatch_legacy_route(ctx: SkillContext):
     ctx.legacy_mode = True
     ctx.force_flow = False
 
-    for name in ("order_query", "ticket_create"):
+    for name in ("order_query", "ticket_create", "feishu_task"):
         outcome = _run_skill(name, ctx)
         trace.append(name)
         _log(
