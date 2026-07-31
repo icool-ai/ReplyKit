@@ -158,7 +158,7 @@ def remember_message(dedupe_key: str) -> bool:
         return True
 
 
-def _http_json(
+def http_json(
     method: str,
     url: str,
     *,
@@ -194,7 +194,7 @@ def verify_app_credentials(app_id: str, app_secret: str) -> None:
     if not aid or not secret:
         raise ValueError("App ID 与 App Secret 不能为空")
     try:
-        data = _http_json(
+        data = http_json(
             "POST",
             "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
             body={"app_id": aid, "app_secret": secret},
@@ -214,7 +214,7 @@ def tenant_access_token(app_id: str, app_secret: str) -> str:
         cached = _token_cache.get(cache_key)
         if cached and time.time() < cached[1]:
             return cached[0]
-    data = _http_json(
+    data = http_json(
         "POST",
         "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
         body={"app_id": app_id, "app_secret": app_secret},
@@ -236,7 +236,7 @@ def reply_text(
     text: str,
 ) -> None:
     token = tenant_access_token(app_id, app_secret)
-    data = _http_json(
+    data = http_json(
         "POST",
         f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
         body={

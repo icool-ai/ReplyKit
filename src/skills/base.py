@@ -13,6 +13,18 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class ChannelContext:
+    """IM / web identity for the current turn (set under bot_lock)."""
+
+    channel: str = "web"  # web | feishu
+    open_id: str = ""
+    feishu_config_id: str = ""
+    app_id: str = ""
+    app_secret: str = ""
+    public_base: str = ""
+
+
+@dataclass
 class SkillContext:
     """Inputs for one skill invocation."""
 
@@ -22,6 +34,7 @@ class SkillContext:
     history: list[Any] | None = None
     intent: IntentResult | None = None
     route_name: str = "unknown"
+    channel_ctx: ChannelContext | None = None
     # FAQ retrieval (optional — filled by router or faq skill)
     search_query: str = ""
     resolve_method: str = "original"

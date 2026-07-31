@@ -7,6 +7,7 @@ ROUTE_TO_SKILL: dict[str, str] = {
     "chitchat": "chitchat",
     "order_query": "order_query",
     "ticket_create": "ticket_create",
+    "feishu_task_query": "feishu_task",
     "faq": "faq_search",
     "unknown": "faq_search",
 }

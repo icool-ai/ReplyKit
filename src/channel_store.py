@@ -64,6 +64,17 @@ class ChannelConfigRow:
         }
 
 
+@dataclass(frozen=True)
+class FeishuUserTokenRow:
+    config_id: str
+    open_id: str
+    access_token: str
+    refresh_token: str
+    expires_at: int
+    refresh_expires_at: int | None
+    updated_at: int
+
+
 class ChannelStore:
     """SQLite store for channel credentials, isolated by owner_username."""
 
@@ -109,6 +120,20 @@ class ChannelStore:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_channel_app_id "
                 "ON channel_configs(channel, app_id)"
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feishu_user_tokens (
+                    config_id TEXT NOT NULL,
+                    open_id TEXT NOT NULL,
+                    access_token TEXT NOT NULL DEFAULT '',
+                    refresh_token TEXT NOT NULL DEFAULT '',
+                    expires_at INTEGER NOT NULL DEFAULT 0,
+                    refresh_expires_at INTEGER,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (config_id, open_id)
+                )
+                """
             )
 
     def close(self) -> None:
@@ -339,6 +364,84 @@ class ChannelStore:
         if holder is not None:
             raise AppIdTakenError(app_id, holder.owner_username)
 
+    def get_feishu_user_token(
+        self, config_id: str, open_id: str
+    ) -> FeishuUserTokenRow | None:
+        cid = config_id.strip()
+        oid = open_id.strip()
+        if not cid or not oid:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM feishu_user_tokens
+                WHERE config_id = ? AND open_id = ?
+                """,
+                (cid, oid),
+            ).fetchone()
+        return _row_to_user_token(row) if row else None
+
+    def upsert_feishu_user_token(
+        self,
+        config_id: str,
+        open_id: str,
+        *,
+        access_token: str,
+        refresh_token: str,
+        expires_at: int,
+        refresh_expires_at: int | None = None,
+    ) -> FeishuUserTokenRow:
+        cid = config_id.strip()
+        oid = open_id.strip()
+        if not cid or not oid:
+            raise ValueError("config_id 与 open_id 不能为空")
+        now = int(time.time())
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO feishu_user_tokens (
+                    config_id, open_id, access_token, refresh_token,
+                    expires_at, refresh_expires_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(config_id, open_id) DO UPDATE SET
+                    access_token = excluded.access_token,
+                    refresh_token = excluded.refresh_token,
+                    expires_at = excluded.expires_at,
+                    refresh_expires_at = excluded.refresh_expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    cid,
+                    oid,
+                    access_token.strip(),
+                    refresh_token.strip(),
+                    int(expires_at),
+                    (
+                        int(refresh_expires_at)
+                        if refresh_expires_at is not None
+                        else None
+                    ),
+                    now,
+                ),
+            )
+        row = self.get_feishu_user_token(cid, oid)
+        assert row is not None
+        return row
+
+    def delete_feishu_user_token(self, config_id: str, open_id: str) -> None:
+        cid = config_id.strip()
+        oid = open_id.strip()
+        if not cid or not oid:
+            return
+        with self._lock:
+            self._conn.execute(
+                """
+                DELETE FROM feishu_user_tokens
+                WHERE config_id = ? AND open_id = ?
+                """,
+                (cid, oid),
+            )
+
 
 def _require_feishu_ready(app_id: str, secret: str, token: str) -> None:
     missing: list[str] = []
@@ -366,6 +469,19 @@ def _row_to_config(row: sqlite3.Row) -> ChannelConfigRow:
         encrypt_key=str(row["encrypt_key"] or ""),
         created_at=int(row["created_at"]),
         updated_at=int(row["updated_at"]),
+    )
+
+
+def _row_to_user_token(row: sqlite3.Row) -> FeishuUserTokenRow:
+    refresh_exp = row["refresh_expires_at"]
+    return FeishuUserTokenRow(
+        config_id=str(row["config_id"]),
+        open_id=str(row["open_id"]),
+        access_token=str(row["access_token"] or ""),
+        refresh_token=str(row["refresh_token"] or ""),
+        expires_at=int(row["expires_at"] or 0),
+        refresh_expires_at=int(refresh_exp) if refresh_exp is not None else None,
+        updated_at=int(row["updated_at"] or 0),
     )
 
 

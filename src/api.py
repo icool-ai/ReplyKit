@@ -30,7 +30,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
@@ -59,6 +59,13 @@ from src.channels.feishu import (
     verify_app_credentials,
     verify_signature as verify_feishu_signature,
 )
+from src.channels.feishu_oauth import (
+    OAUTH_CALLBACK_PATH,
+    consume_oauth_state,
+    exchange_code_for_token,
+    html_oauth_page,
+    oauth_redirect_uri,
+)
 from src.channels.wecom import (
     WeComCryptoError,
     decrypt_post,
@@ -71,6 +78,7 @@ from src.channels.wecom import (
 from src.chat_log import ChatLogStore, log_turn_safe
 from src.chatbot import CustomerServiceBot
 from src.config import Settings, get_settings
+from src.skills.base import ChannelContext
 from src.faq_import import (
     SUPPORTED_FORMATS,
     build_template_file,
@@ -544,14 +552,16 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             "code 与 HTTP 状态一致（200 成功，4xx/500 失败）。"
             "鉴权：POST /auth/login 换 JWT（含 role）；"
             "Authorization: Bearer <access_token>。"
-            "公开：/health、企微/飞书回调、/auth/login、/auth/register、/auth/refresh。"
+            "公开：/health、企微/飞书回调、飞书 OAuth 回调、"
+            "/auth/login、/auth/register、/auth/refresh。"
             "普通用户：/chat、/sessions*、GET /bot-scripts、/channels/feishu*；"
             "运营 ops：/faqs*、/sensitive-words*、POST /bot-scripts*、/users*。"
             "POST /chat；GET /sessions；"
             "POST /faqs、/faqs/list…；POST /users、/users/list、/users/update、/users/reset-password；"
             "GET /bot-scripts（登录可读）；POST /bot-scripts*（ops）；"
             "GET/POST /channels/feishu*（登录用户各自隔离；App ID 独占）；"
-            "POST /webhooks/feishu（公开，飞书事件，无 JWT；按 App ID/Token 匹配配置）。"
+            "POST /webhooks/feishu（公开，飞书事件，无 JWT；按 App ID/Token 匹配配置）；"
+            f"GET {OAUTH_CALLBACK_PATH}（公开，飞书用户授权回调，返回 HTML）。"
         ),
     )
     # 本地 Vue(Vite) 直连 API 时用；开发默认走 Vite proxy，生产建议同源反向代理
@@ -837,29 +847,33 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
                 session = store.get(session_id)
                 with bot_lock:
                     bot.load_session(session.bot_state)
-                    result = bot.chat_result(
-                        incoming.content, history=session.history
-                    )
-                    display_user = (
-                        bot.last_effective_query or incoming.content
-                    ).strip()
-                    history = list(session.history) + [
-                        {"role": "user", "content": display_user},
-                        {"role": "assistant", "content": result.answer},
-                    ]
-                    store.save(
-                        session_id,
-                        history=history,
-                        bot_state=bot.dump_session(),
-                        username=f"wecom:{incoming.from_user}",
-                    )
-                    log_turn_safe(
-                        chat_logs,
-                        session_id=session_id,
-                        question=display_user,
-                        result=result,
-                        username=f"wecom:{incoming.from_user}",
-                    )
+                    bot.channel_ctx = ChannelContext(channel="wecom")
+                    try:
+                        result = bot.chat_result(
+                            incoming.content, history=session.history
+                        )
+                        display_user = (
+                            bot.last_effective_query or incoming.content
+                        ).strip()
+                        history = list(session.history) + [
+                            {"role": "user", "content": display_user},
+                            {"role": "assistant", "content": result.answer},
+                        ]
+                        store.save(
+                            session_id,
+                            history=history,
+                            bot_state=bot.dump_session(),
+                            username=f"wecom:{incoming.from_user}",
+                        )
+                        log_turn_safe(
+                            chat_logs,
+                            session_id=session_id,
+                            question=display_user,
+                            result=result,
+                            username=f"wecom:{incoming.from_user}",
+                        )
+                    finally:
+                        bot.channel_ctx = None
                 images = paths_to_asset_urls(
                     result.images,
                     settings.assets_dir,
@@ -944,25 +958,36 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             session = store.get(session_id)
             with bot_lock:
                 bot.load_session(session.bot_state)
-                result = bot.chat_result(text, history=session.history)
-                display_user = (bot.last_effective_query or text).strip()
-                history = list(session.history) + [
-                    {"role": "user", "content": display_user},
-                    {"role": "assistant", "content": result.answer},
-                ]
-                store.save(
-                    session_id,
-                    history=history,
-                    bot_state=bot.dump_session(),
-                    username=username,
+                bot.channel_ctx = ChannelContext(
+                    channel="feishu",
+                    open_id=open_id,
+                    feishu_config_id=config_id,
+                    app_id=app_id,
+                    app_secret=app_secret,
+                    public_base=public_base,
                 )
-                log_turn_safe(
-                    chat_logs,
-                    session_id=session_id,
-                    question=display_user,
-                    result=result,
-                    username=username,
-                )
+                try:
+                    result = bot.chat_result(text, history=session.history)
+                    display_user = (bot.last_effective_query or text).strip()
+                    history = list(session.history) + [
+                        {"role": "user", "content": display_user},
+                        {"role": "assistant", "content": result.answer},
+                    ]
+                    store.save(
+                        session_id,
+                        history=history,
+                        bot_state=bot.dump_session(),
+                        username=username,
+                    )
+                    log_turn_safe(
+                        chat_logs,
+                        session_id=session_id,
+                        question=display_user,
+                        result=result,
+                        username=username,
+                    )
+                finally:
+                    bot.channel_ctx = None
             images = paths_to_asset_urls(
                 result.images,
                 settings.assets_dir,
@@ -1217,6 +1242,100 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             )
         return {"code": 0}
 
+    @app.get(OAUTH_CALLBACK_PATH, response_class=HTMLResponse)
+    def feishu_oauth_callback(
+        request: Request,
+        code: str | None = Query(default=None),
+        state: str | None = Query(default=None),
+        error: str | None = Query(default=None),
+    ) -> HTMLResponse:
+        """飞书用户授权回调（公开 HTML）：用 code 换 user_access_token 并落库。"""
+        if error:
+            return HTMLResponse(
+                content=html_oauth_page(
+                    title="授权已取消",
+                    message="你已取消飞书授权。请回到飞书，重新对机器人说查询任务以获取新链接。",
+                    ok=False,
+                ),
+                status_code=400,
+            )
+        if not code or not state:
+            return HTMLResponse(
+                content=html_oauth_page(
+                    title="授权失败",
+                    message="缺少授权参数。请回到飞书重新获取授权链接。",
+                    ok=False,
+                ),
+                status_code=400,
+            )
+        bound = consume_oauth_state(state)
+        if bound is None:
+            return HTMLResponse(
+                content=html_oauth_page(
+                    title="链接已失效",
+                    message="授权链接无效或已过期。请回到飞书重新说一次「我的任务」。",
+                    ok=False,
+                ),
+                status_code=400,
+            )
+        config_id, open_id = bound
+        row = channel_store.get_by_id(config_id)
+        if row is None or row.channel != "feishu":
+            return HTMLResponse(
+                content=html_oauth_page(
+                    title="配置异常",
+                    message="应用配置不存在，请联系管理员检查飞书渠道配置。",
+                    ok=False,
+                ),
+                status_code=400,
+            )
+        if not row.app_id.strip() or not row.app_secret.strip():
+            return HTMLResponse(
+                content=html_oauth_page(
+                    title="配置异常",
+                    message="飞书 App 凭证不完整，请管理员补全 App ID / Secret。",
+                    ok=False,
+                ),
+                status_code=400,
+            )
+        try:
+            redirect_uri = oauth_redirect_uri(
+                _public_base_url(request, settings)
+            )
+            token = exchange_code_for_token(
+                app_id=row.app_id,
+                app_secret=row.app_secret,
+                code=code,
+                redirect_uri=redirect_uri,
+            )
+            channel_store.upsert_feishu_user_token(
+                config_id,
+                open_id,
+                access_token=token.access_token,
+                refresh_token=token.refresh_token,
+                expires_at=token.expires_at,
+                refresh_expires_at=token.refresh_expires_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).exception(
+                "feishu oauth exchange failed config=%s", config_id
+            )
+            return HTMLResponse(
+                content=html_oauth_page(
+                    title="授权失败",
+                    message=f"换取访问凭证失败，请稍后重试。详情：{exc}",
+                    ok=False,
+                ),
+                status_code=502,
+            )
+        return HTMLResponse(
+            content=html_oauth_page(
+                title="授权成功",
+                message="飞书账号已授权。请回到飞书，再次发送「我有哪些未完成的任务」即可查询。",
+                ok=True,
+            )
+        )
+
     @app.post("/webhooks/feishu")
     async def feishu_webhook(
         request: Request,
@@ -1289,25 +1408,32 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
 
         with bot_lock:
             bot.load_session(session.bot_state)
-            result = bot.chat_result(message, history=session.history)
-            display_user = (bot.last_effective_query or message).strip()
-            history = list(session.history) + [
-                {"role": "user", "content": display_user},
-                {"role": "assistant", "content": result.answer},
-            ]
-            store.save(
-                session_id,
-                history=history,
-                bot_state=bot.dump_session(),
-                username=username,
+            bot.channel_ctx = ChannelContext(
+                channel="web",
+                public_base=_public_base_url(request, settings),
             )
-            log_turn_safe(
-                chat_logs,
-                session_id=session_id,
-                question=display_user,
-                result=result,
-                username=username,
-            )
+            try:
+                result = bot.chat_result(message, history=session.history)
+                display_user = (bot.last_effective_query or message).strip()
+                history = list(session.history) + [
+                    {"role": "user", "content": display_user},
+                    {"role": "assistant", "content": result.answer},
+                ]
+                store.save(
+                    session_id,
+                    history=history,
+                    bot_state=bot.dump_session(),
+                    username=username,
+                )
+                log_turn_safe(
+                    chat_logs,
+                    session_id=session_id,
+                    question=display_user,
+                    result=result,
+                    username=username,
+                )
+            finally:
+                bot.channel_ctx = None
 
         images = paths_to_asset_urls(
             result.images,
