@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   ChatDotRound,
   ChatLineSquare,
+  Connection,
   Document,
   User,
   Warning,
@@ -29,6 +30,7 @@ const active = computed(() => {
   if (route.path.startsWith('/faqs')) return '/faqs'
   if (route.path.startsWith('/sensitive')) return '/sensitive'
   if (route.path.startsWith('/bot-scripts')) return '/bot-scripts'
+  if (route.path.startsWith('/channels')) return '/channels'
   if (route.path.startsWith('/users')) return '/users'
   return '/chat'
 })
@@ -59,6 +61,10 @@ async function onLogout() {
         <el-menu-item index="/chat">
           <el-icon><ChatDotRound /></el-icon>
           <span>对话</span>
+        </el-menu-item>
+        <el-menu-item index="/channels">
+          <el-icon><Connection /></el-icon>
+          <span>渠道配置</span>
         </el-menu-item>
         <template v-if="showOps">
           <el-menu-item index="/faqs">

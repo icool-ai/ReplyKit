@@ -10,13 +10,25 @@ File download responses (e.g. FAQ templates) remain raw binary.
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import logging
 import uuid
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Security, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Security,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -31,6 +43,21 @@ from src.bot_config import (
     load_bot_scripts_template,
     reset_bot_scripts_from_template,
     save_bot_scripts,
+)
+from src.channel_store import AppIdTakenError, ChannelConfigRow, get_channel_store
+from src.channels.feishu import (
+    FeishuCryptoError,
+    extract_text as feishu_extract_text,
+    feishu_can_reply,
+    feishu_ready,
+    feishu_setup_hint,
+    format_bot_answer as format_feishu_answer,
+    parse_event_body as parse_feishu_event_body,
+    remember_message as remember_feishu_message,
+    reply_text as feishu_reply_text,
+    session_id_for as feishu_session_id,
+    verify_app_credentials,
+    verify_signature as verify_feishu_signature,
 )
 from src.channels.wecom import (
     WeComCryptoError,
@@ -346,6 +373,37 @@ class BotScriptsUpdateRequest(BaseModel):
     chitchat_phrases: list[str] = Field(default_factory=list)
 
 
+class FeishuChannelData(BaseModel):
+    id: str | None = None
+    owner_username: str
+    channel: str = "feishu"
+    enabled: bool = False
+    app_id: str = ""
+    app_secret_set: bool = False
+    verification_token_set: bool = False
+    encrypt_key_set: bool = False
+    callback_path: str | None = None
+    created_at: int | None = None
+    updated_at: int | None = None
+
+
+class FeishuChannelUpdateRequest(BaseModel):
+    enabled: bool
+    app_id: str = ""
+    app_secret: str | None = Field(
+        default=None,
+        description="留空或不传则保留原值；首次启用必填",
+    )
+    verification_token: str | None = Field(
+        default=None,
+        description="留空或不传则保留原值；首次启用必填",
+    )
+    encrypt_key: str | None = Field(
+        default=None,
+        description="留空或不传则保留原值",
+    )
+
+
 class SensitiveItem(BaseModel):
     id: str
     pattern: str
@@ -454,6 +512,7 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
     chat_logs = ChatLogStore(settings.chat_log_db_path)
     faq_store = FaqStore(settings.faq_db_path)
     sensitive_store = get_sensitive_store(settings.sensitive_db_path)
+    channel_store = get_channel_store(settings.channels_db_path)
     auth = AuthService(
         db_path=settings.auth_db_path,
         jwt_secret=settings.jwt_secret,
@@ -466,6 +525,16 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
     bot_lock = threading.Lock()
     faq_lock = threading.Lock()
     sensitive_lock = threading.Lock()
+    channel_lock = threading.Lock()
+
+    def _empty_feishu(owner: str) -> dict[str, Any]:
+        return FeishuChannelData(
+            owner_username=owner,
+            callback_path="/webhooks/feishu",
+        ).model_dump()
+
+    def _feishu_public(row: Any) -> dict[str, Any]:
+        return FeishuChannelData(**row.to_public_dict()).model_dump()
 
     app = FastAPI(
         title="ReplyKit API",
@@ -475,12 +544,14 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             "code 与 HTTP 状态一致（200 成功，4xx/500 失败）。"
             "鉴权：POST /auth/login 换 JWT（含 role）；"
             "Authorization: Bearer <access_token>。"
-            "公开：/health、企微回调、/auth/login、/auth/register、/auth/refresh。"
-            "普通用户：/chat、/sessions*、GET /bot-scripts；"
+            "公开：/health、企微/飞书回调、/auth/login、/auth/register、/auth/refresh。"
+            "普通用户：/chat、/sessions*、GET /bot-scripts、/channels/feishu*；"
             "运营 ops：/faqs*、/sensitive-words*、POST /bot-scripts*、/users*。"
             "POST /chat；GET /sessions；"
             "POST /faqs、/faqs/list…；POST /users、/users/list、/users/update、/users/reset-password；"
-            "GET /bot-scripts（登录可读）；POST /bot-scripts*（ops）。"
+            "GET /bot-scripts（登录可读）；POST /bot-scripts*（ops）；"
+            "GET/POST /channels/feishu*（登录用户各自隔离；App ID 独占）；"
+            "POST /webhooks/feishu（公开，飞书事件，无 JWT；按 App ID/Token 匹配配置）。"
         ),
     )
     # 本地 Vue(Vite) 直连 API 时用；开发默认走 Vite proxy，生产建议同源反向代理
@@ -815,6 +886,375 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             logging.getLogger(__name__).exception("wecom encrypt reply failed")
             return Response(content="", media_type="text/plain")
         return Response(content=encrypted, media_type="application/xml")
+
+    def _feishu_handle_message(
+        *,
+        config_id: str,
+        app_id: str,
+        app_secret: str,
+        event: dict[str, Any],
+        public_base: str,
+    ) -> None:
+        message = event.get("message") or {}
+        sender = event.get("sender") or {}
+        msg_type = (message.get("message_type") or "").lower()
+        message_id = message.get("message_id") or ""
+        if not message_id:
+            return
+        dedupe = f"{config_id}:{message_id}"
+        if not remember_feishu_message(dedupe):
+            logging.getLogger(__name__).info(
+                "feishu skip duplicate config=%s message_id=%s",
+                config_id,
+                message_id,
+            )
+            return
+
+        chat_type = (message.get("chat_type") or "").lower()
+        if chat_type == "group":
+            mentions = message.get("mentions") or []
+            if not mentions:
+                logging.getLogger(__name__).info(
+                    "feishu skip group without @bot config=%s message_id=%s",
+                    config_id,
+                    message_id,
+                )
+                return
+
+        def _reply(text: str) -> None:
+            feishu_reply_text(
+                app_id=app_id,
+                app_secret=app_secret,
+                message_id=message_id,
+                text=text,
+            )
+
+        if msg_type != "text":
+            _reply("当前仅支持文字消息，请直接输入问题。")
+            return
+
+        text = feishu_extract_text(message.get("content") or "")
+        if not text:
+            return
+
+        open_id = ((sender.get("sender_id") or {}).get("open_id") or "").strip()
+        session_id = feishu_session_id(config_id, open_id or message_id)
+        username = f"feishu:{config_id}:{open_id or message_id}"
+        try:
+            session = store.get(session_id)
+            with bot_lock:
+                bot.load_session(session.bot_state)
+                result = bot.chat_result(text, history=session.history)
+                display_user = (bot.last_effective_query or text).strip()
+                history = list(session.history) + [
+                    {"role": "user", "content": display_user},
+                    {"role": "assistant", "content": result.answer},
+                ]
+                store.save(
+                    session_id,
+                    history=history,
+                    bot_state=bot.dump_session(),
+                    username=username,
+                )
+                log_turn_safe(
+                    chat_logs,
+                    session_id=session_id,
+                    question=display_user,
+                    result=result,
+                    username=username,
+                )
+            images = paths_to_asset_urls(
+                result.images,
+                settings.assets_dir,
+                base_url=public_base,
+            )
+            answer = format_feishu_answer(
+                result.answer,
+                clarify_options=list(result.clarify_options),
+                images=images,
+            )
+            _reply(answer)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception(
+                "feishu bot failed config=%s", config_id
+            )
+            try:
+                _reply("系统繁忙，请稍后再试。")
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).exception(
+                    "feishu error reply failed config=%s", config_id
+                )
+
+    def _feishu_reply_hint(
+        *,
+        app_id: str,
+        app_secret: str,
+        message_id: str,
+        hint: str,
+    ) -> None:
+        if not message_id or not app_id or not app_secret:
+            return
+        try:
+            feishu_reply_text(
+                app_id=app_id,
+                app_secret=app_secret,
+                message_id=message_id,
+                text=hint,
+            )
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception(
+                "feishu setup hint reply failed app_id=%s", app_id
+            )
+
+    def _resolve_feishu_row(
+        raw: bytes,
+        *,
+        fixed_row: ChannelConfigRow | None = None,
+        timestamp: str | None = None,
+        nonce: str | None = None,
+        signature: str | None = None,
+    ) -> tuple[ChannelConfigRow, dict[str, Any]]:
+        try:
+            outer = json.loads(raw.decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400,
+                detail="请求体不是合法 JSON，请检查飞书回调是否指向正确地址",
+            ) from exc
+
+        all_rows = (
+            [fixed_row]
+            if fixed_row is not None
+            else channel_store.list_feishu()
+        )
+        if not all_rows:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "尚未在 ReplyKit「渠道配置」中保存飞书凭证。"
+                    "请先登录前端填写 App ID 等并启用，再保存飞书请求地址。"
+                ),
+            )
+
+        if "encrypt" in outer:
+            for row in all_rows:
+                if not row.encrypt_key:
+                    continue
+                if signature:
+                    if not (
+                        timestamp
+                        and nonce
+                        and verify_feishu_signature(
+                            row.encrypt_key, timestamp, nonce, raw, signature
+                        )
+                    ):
+                        continue
+                try:
+                    body = parse_feishu_event_body(raw, row.encrypt_key)
+                except FeishuCryptoError:
+                    continue
+                header = body.get("header") or {}
+                app_id = str(header.get("app_id") or "").strip()
+                if app_id and row.app_id and app_id != row.app_id:
+                    continue
+                token = str(body.get("token") or header.get("token") or "").strip()
+                if (
+                    token
+                    and row.verification_token
+                    and token != row.verification_token
+                ):
+                    continue
+                return row, body
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "无法用已保存的 Encrypt Key 解密/验签。"
+                    "请确认 ReplyKit「渠道配置」中的 Encrypt Key、"
+                    "Verification Token 与飞书后台一致，并已保存。"
+                ),
+            )
+
+        body = outer
+        header = body.get("header") or {}
+        app_id = str(header.get("app_id") or "").strip()
+        token = str(body.get("token") or header.get("token") or "").strip()
+
+        row: ChannelConfigRow | None = None
+        if fixed_row is not None:
+            row = fixed_row
+        elif app_id:
+            row = channel_store.find_by_app_id(app_id)
+        if row is None and token:
+            row = channel_store.find_by_verification_token(token)
+        if row is None:
+            ready = [r for r in all_rows if feishu_ready(r)]
+            if len(ready) == 1:
+                row = ready[0]
+            elif len(all_rows) == 1:
+                row = all_rows[0]
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "未匹配到飞书渠道配置。"
+                    "请确认页面已保存对应 App ID，且飞书事件来自该应用。"
+                ),
+            )
+
+        if row.encrypt_key and signature:
+            if not (
+                timestamp
+                and nonce
+                and verify_feishu_signature(
+                    row.encrypt_key, timestamp, nonce, raw, signature
+                )
+            ):
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "签名校验失败。请检查 Encrypt Key 是否与飞书后台一致。"
+                    ),
+                )
+        if token and row.verification_token and token != row.verification_token:
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Verification Token 不匹配。"
+                    "请核对 ReplyKit「渠道配置」与飞书「加密策略」中的 Token。"
+                ),
+            )
+        return row, body
+
+    async def _dispatch_feishu_webhook(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        *,
+        fixed_row: ChannelConfigRow | None = None,
+        x_lark_request_timestamp: str | None = None,
+        x_lark_request_nonce: str | None = None,
+        x_lark_signature: str | None = None,
+    ) -> dict[str, Any]:
+        raw = await request.body()
+        row, body = _resolve_feishu_row(
+            raw,
+            fixed_row=fixed_row,
+            timestamp=x_lark_request_timestamp,
+            nonce=x_lark_request_nonce,
+            signature=x_lark_signature,
+        )
+        hint = feishu_setup_hint(row)
+
+        if body.get("type") == "url_verification" or body.get("challenge"):
+            token = body.get("token") or ""
+            if row.verification_token and token != row.verification_token:
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "Verification Token 不匹配，URL 校验失败。"
+                        "请在 ReplyKit「渠道配置」填写与飞书后台一致的 Token。"
+                    ),
+                )
+            if not feishu_ready(row):
+                # 仍返回 challenge，方便管理员先通过 URL 校验；同时用 detail 打日志
+                logging.getLogger(__name__).warning(
+                    "feishu url_verification ok but config not ready owner=%s: %s",
+                    row.owner_username,
+                    hint,
+                )
+            return {"challenge": body["challenge"]}
+
+        header = body.get("header") or {}
+        token = body.get("token") or header.get("token") or ""
+        if row.verification_token and token and token != row.verification_token:
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Verification Token 不匹配。"
+                    "请核对 ReplyKit「渠道配置」与飞书后台。"
+                ),
+            )
+
+        event_type = header.get("event_type") or body.get("type") or ""
+        if event_type == "im.message.receive_v1":
+            event = body.get("event") or {}
+            message = event.get("message") or {}
+            message_id = str(message.get("message_id") or "")
+
+            if not feishu_ready(row):
+                logging.getLogger(__name__).warning(
+                    "feishu message but config not ready owner=%s: %s",
+                    row.owner_username,
+                    hint,
+                )
+                chat_type = str((message.get("chat_type") or "")).lower()
+                if chat_type == "group" and not (message.get("mentions") or []):
+                    return {"code": 0}
+                if feishu_can_reply(row) and message_id:
+                    background_tasks.add_task(
+                        _feishu_reply_hint,
+                        app_id=row.app_id,
+                        app_secret=row.app_secret,
+                        message_id=message_id,
+                        hint=hint,
+                    )
+                    return {"code": 0}
+                raise HTTPException(status_code=503, detail=hint)
+
+            public_base = _public_base_url(request, settings)
+            background_tasks.add_task(
+                _feishu_handle_message,
+                config_id=row.id,
+                app_id=row.app_id,
+                app_secret=row.app_secret,
+                event=event,
+                public_base=public_base,
+            )
+        else:
+            logging.getLogger(__name__).info(
+                "feishu ignore event_type=%s owner=%s",
+                event_type,
+                row.owner_username,
+            )
+        return {"code": 0}
+
+    @app.post("/webhooks/feishu")
+    async def feishu_webhook(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        x_lark_request_timestamp: str | None = Header(default=None),
+        x_lark_request_nonce: str | None = Header(default=None),
+        x_lark_signature: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """飞书事件回调（公开固定地址）：按 App ID / Token 匹配页面配置。"""
+        return await _dispatch_feishu_webhook(
+            request,
+            background_tasks,
+            x_lark_request_timestamp=x_lark_request_timestamp,
+            x_lark_request_nonce=x_lark_request_nonce,
+            x_lark_signature=x_lark_signature,
+        )
+
+    @app.post("/webhooks/feishu/{config_id}")
+    async def feishu_webhook_by_id(
+        config_id: str,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        x_lark_request_timestamp: str | None = Header(default=None),
+        x_lark_request_nonce: str | None = Header(default=None),
+        x_lark_signature: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """兼容旧 URL（带 config_id）；新配置请用 /webhooks/feishu。"""
+        row = channel_store.get_by_id(config_id)
+        if row is None or row.channel != "feishu":
+            raise HTTPException(status_code=404, detail="未知的飞书渠道配置")
+        return await _dispatch_feishu_webhook(
+            request,
+            background_tasks,
+            fixed_row=row,
+            x_lark_request_timestamp=x_lark_request_timestamp,
+            x_lark_request_nonce=x_lark_request_nonce,
+            x_lark_signature=x_lark_signature,
+        )
 
     @app.post("/chat", response_model=ApiResponse[ChatData])
     def chat(
@@ -1186,6 +1626,61 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             BotScriptsData(**data).model_dump(),
             message="已用模板初始化话术（热更新，无需重启）",
         )
+
+    @app.get("/channels/feishu", response_model=ApiResponse[FeishuChannelData])
+    def channels_feishu_get(
+        user: dict[str, Any] = Depends(require_auth),
+    ) -> dict[str, Any]:
+        owner = str(user["sub"])
+        row = channel_store.get_for_owner(owner, "feishu")
+        if row is None:
+            return ok(_empty_feishu(owner))
+        return ok(_feishu_public(row))
+
+    @app.post(
+        "/channels/feishu/update",
+        response_model=ApiResponse[FeishuChannelData],
+    )
+    def channels_feishu_update(
+        req: FeishuChannelUpdateRequest,
+        user: dict[str, Any] = Depends(require_auth),
+    ) -> dict[str, Any]:
+        owner = str(user["sub"])
+
+        def _optional_secret(value: str | None) -> str | None:
+            # None / 纯空白 → 保留原值；有内容 → 覆盖
+            if value is None:
+                return None
+            if not value.strip():
+                return None
+            return value.strip()
+
+        existing = channel_store.get_for_owner(owner, "feishu")
+        merged_secret = _optional_secret(req.app_secret)
+        if merged_secret is None and existing is not None:
+            merged_secret = existing.app_secret
+        merged_secret = (merged_secret or "").strip()
+        if req.enabled and req.app_id.strip() and merged_secret:
+            try:
+                verify_app_credentials(req.app_id.strip(), merged_secret)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            with channel_lock:
+                row = channel_store.upsert_feishu(
+                    owner,
+                    enabled=req.enabled,
+                    app_id=req.app_id,
+                    app_secret=_optional_secret(req.app_secret),
+                    verification_token=_optional_secret(req.verification_token),
+                    encrypt_key=_optional_secret(req.encrypt_key),
+                )
+        except AppIdTakenError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return ok(_feishu_public(row), message="飞书渠道配置已保存")
 
     @app.post("/sensitive-words/list", response_model=ApiResponse[SensitiveListData])
     def sensitive_list(

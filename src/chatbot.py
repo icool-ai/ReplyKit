@@ -12,9 +12,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
 from src.chitchat import (
-    chitchat_reply,
     contains_sensitive,
-    is_chitchat,
     sensitive_reply,
 )
 from src.config import Settings
@@ -35,11 +33,10 @@ from src.handoff import (
     normalize_for_repeat,
     should_handoff,
 )
-from src.intent import classify_intent, route_from_intent
+from src.intent import IntentResult, classify_intent, route_from_intent
 from src.knowledge import (
     ensure_vectorstore,
     search_faq,
-    vectorstore_exists,
 )
 from src.tools.business_db import configure_business_db
 
@@ -108,6 +105,7 @@ class ChatResult:
     faq_id: str | None = None
     top_score: float | None = None
     clarify_options: list[str] = field(default_factory=list)
+    skill_trace: list[str] = field(default_factory=list)
 
 
 def _log(title: str, body: str = "") -> None:
@@ -363,6 +361,320 @@ class CustomerServiceBot:
         limit = max(self.settings.top_k, min(8, self.settings.top_k * max(len(queries), 1)))
         return unique[:limit], merged_cands, "faq"
 
+    def run_faq_turn(
+        self,
+        user_message: str,
+        history: list | None,
+        *,
+        intent: IntentResult | None = None,
+        legacy: bool = False,
+    ) -> ChatResult:
+        """FAQ retrieval + answer generation (faq_search skill backend)."""
+        search_query = user_message.strip()
+        resolve_method = "original"
+        docs: list[Document] = []
+        candidates: list[tuple[float, str, str]] = []
+        route = "none"
+
+        if intent is not None:
+            queries = intent.faq_queries
+            if not queries:
+                search_query, resolve_method = resolve_search_query(
+                    self.llm,
+                    user_message,
+                    history,
+                    last_topic=self.last_topic,
+                )
+                queries = [search_query]
+            else:
+                resolve_method = "intent"
+                search_query = " | ".join(queries)
+                _log("检索问句(意图)", search_query)
+            docs, candidates, route = self._search_faq_multi(queries)
+        elif legacy:
+            search_query, resolve_method = resolve_search_query(
+                self.llm,
+                user_message,
+                history,
+                last_topic=self.last_topic,
+            )
+            if resolve_method == "original":
+                _log("追问改写", "未改写（完整问句或不像追问）")
+            else:
+                _log(
+                    "追问改写",
+                    f"method={resolve_method}\n原文：{user_message}\n检索问句：{search_query}"
+                    + (
+                        f"\nlast_topic：{self.last_topic}"
+                        if self.last_topic
+                        else ""
+                    ),
+                )
+            docs, candidates, route = search_faq(
+                self.settings, search_query, k=self.settings.top_k
+            )
+        else:
+            docs, candidates, route = search_faq(
+                self.settings, search_query, k=self.settings.top_k
+            )
+
+        return self._finalize_faq_turn(
+            user_message,
+            history,
+            docs,
+            candidates,
+            route,
+            search_query,
+            resolve_method,
+        )
+
+    def _finalize_faq_turn(
+        self,
+        user_message: str,
+        history: list | None,
+        docs: list[Document],
+        candidates: list[tuple[float, str, str]],
+        route: str,
+        search_query: str,
+        resolve_method: str,
+    ) -> ChatResult:
+        _log(
+            "检索路由",
+            {
+                "faq": "采用 FAQ（意图→混合检索"
+                + ("+精排" if self.settings.rerank_enabled else "")
+                + "）",
+                "none": "FAQ 未命中",
+            }.get(route, route),
+        )
+        if docs and (docs[0].metadata or {}).get("_retrieve_debug"):
+            _log("混合检索", str((docs[0].metadata or {}).get("_retrieve_debug")))
+
+        clarify_th = self.settings.clarify_threshold
+        direct_th = self.settings.direct_threshold
+        if candidates:
+            score_lines = []
+            for i, (score, label, doc_type) in enumerate(candidates, 1):
+                if (
+                    "[精排" in label
+                    or "[未进精排]" in label
+                    or "[无关键词" in label
+                ):
+                    mark = "[已过滤]"
+                elif score < clarify_th:
+                    mark = "[丢弃:低于澄清阈值]"
+                elif doc_type == "faq" and score >= direct_th:
+                    mark = "[FAQ可直出]"
+                elif score >= clarify_th:
+                    mark = "[澄清区间/可采用]"
+                else:
+                    mark = ""
+                score_lines.append(
+                    f"  {i}. score={score:.4f} type={doc_type}  {label}  {mark}"
+                )
+            _log(
+                "检索候选（"
+                f"澄清阈值={clarify_th}, 直出阈值={direct_th}；实际采用={route}）",
+                "\n".join(score_lines),
+            )
+        else:
+            _log("检索候选", "向量库无结果。")
+
+        if not docs or route == "none":
+            self.last_clarify_options = []
+            self.consecutive_no_answer += 1
+            no_th = handoff_after_no_answer()
+            _log(
+                "检索结果",
+                f"FAQ/手册均无片段达到澄清阈值 {clarify_th}。"
+                f"（连续无答案 {self.consecutive_no_answer}/{no_th}）",
+            )
+            if self.consecutive_no_answer >= no_th:
+                self._reset_auto_handoff_counters()
+                answer = auto_handoff_reply("no_answer")
+                _log("结果", f"连续无答案 {no_th} 次，自动转人工。")
+                return ChatResult(
+                    answer=answer, route="handoff", strategy="auto_no_answer"
+                )
+            answer = no_knowledge_reply()
+            return ChatResult(answer=answer, route="none", strategy="reject")
+
+        topic = topic_from_docs(docs)
+        if topic:
+            self.last_topic = topic
+
+        sources: list[str] = []
+        chunk_logs: list[str] = []
+        for i, doc in enumerate(docs, 1):
+            source = doc.metadata.get("source", "未知来源")
+            doc_type = doc.metadata.get("doc_type", "")
+            score = doc.metadata.get("score", "")
+            score_text = f"{float(score):.4f}" if score != "" else "?"
+            faq_id = doc.metadata.get("faq_id", "")
+            question = doc.metadata.get("question", "")
+            match_text = doc.metadata.get("match_text", "")
+            phrase_role = doc.metadata.get("phrase_role", "")
+            images = doc.metadata.get("images") or []
+            if isinstance(images, str):
+                images = [images] if images else []
+            if source not in sources:
+                sources.append(source)
+            name = Path(str(source)).name
+            head = (
+                f"[片段 {i}] score={score_text} type={doc_type} "
+                f"source={name} images={len(images)}"
+            )
+            if faq_id:
+                head += f" faq_id={faq_id}"
+            if phrase_role:
+                head += f" hit={phrase_role}:{match_text or doc.page_content}"
+            body = (
+                f"Q: {question}\nA: {doc.metadata.get('answer', '')}"
+                if _is_structured_faq(doc)
+                else doc.page_content
+            )
+            chunk_logs.append(f"{head}\n{body}")
+        _log("采用的参考知识", "\n\n".join(chunk_logs))
+
+        top = docs[0]
+        top_score = float(top.metadata.get("score") or 0.0)
+        top_faq_id = str(top.metadata.get("faq_id") or "") or None
+        dialogue = format_history_for_rewrite(history)
+        has_prior = bool(dialogue and dialogue != "（无）")
+        is_followup = resolve_method != "original" or looks_like_followup(
+            user_message, has_context=has_prior
+        )
+        faq_docs = _unique_faq_docs(docs)
+        multi_faq = len(faq_docs) >= 2
+
+        can_direct = _faq_can_direct(user_message, top)
+        if (
+            _is_structured_faq(top)
+            and top_score >= direct_th
+            and not is_followup
+            and can_direct
+            and not multi_faq
+        ):
+            answer = str(top.metadata.get("answer") or "").strip()
+            _log(
+                "策略",
+                f"FAQ 直出（score={top_score:.4f} >= {direct_th}，问句近匹配）",
+            )
+            _log("模型原始返回", f"（未调用模型）\n{answer}")
+            self.last_clarify_options = []
+            self._mark_answered()
+            return ChatResult(
+                answer=answer,
+                sources=sources[:1],
+                route="faq",
+                strategy="direct",
+                faq_id=top_faq_id,
+                top_score=top_score,
+            )
+
+        if (
+            not self.settings.hybrid_search
+            and _is_structured_faq(top)
+            and top_score < direct_th
+            and not is_followup
+        ):
+            options = _clarify_options(faq_docs or docs, self.settings.clarify_count)
+            answer = _format_clarify(options)
+            self.last_clarify_options = options
+            self._mark_answered()
+            _log(
+                "策略",
+                f"FAQ 澄清（{clarify_th} <= score={top_score:.4f} < {direct_th}）"
+                f"；候选={len(options)}",
+            )
+            _log("模型原始返回", f"（未调用模型）\n{answer}")
+            return ChatResult(
+                answer=answer,
+                sources=sources,
+                route="faq",
+                strategy="clarify",
+                faq_id=top_faq_id,
+                top_score=top_score,
+                clarify_options=options,
+            )
+
+        self.last_clarify_options = []
+        gen_docs = docs
+        if multi_faq:
+            gen_docs = faq_docs
+        elif _is_structured_faq(top) and top_score >= direct_th and not can_direct:
+            gen_docs = [top]
+
+        context = _context_from_docs(gen_docs)
+        if not context.strip():
+            self.consecutive_no_answer += 1
+            no_th = handoff_after_no_answer()
+            answer = no_knowledge_reply()
+            _log("检索结果", "内容为空，未调用模型。")
+            if self.consecutive_no_answer >= no_th:
+                self._reset_auto_handoff_counters()
+                answer = auto_handoff_reply("no_answer")
+                return ChatResult(
+                    answer=answer, route="handoff", strategy="auto_no_answer"
+                )
+            return ChatResult(answer=answer, route=route, strategy="reject")
+
+        images = _collect_images(gen_docs)
+        if images:
+            _log("关联配图", "\n".join(f"  - {p}" for p in images))
+        else:
+            _log("关联配图", "无")
+
+        strategy = "rag"
+        if multi_faq:
+            strategy = "synthesize"
+            _log(
+                "策略",
+                f"多 FAQ 综合润色（{len(faq_docs)} 条相关知识，模型合并作答）",
+            )
+        elif _is_structured_faq(top) and top_score >= direct_th and not can_direct:
+            strategy = "faq_grounded"
+            _log(
+                "策略",
+                "FAQ 高分但非近匹配：模型核对是否真正答到问题；不足则说明暂无相关信息",
+            )
+        elif _is_structured_faq(top) and is_followup:
+            strategy = "rag_followup"
+            _log(
+                "策略",
+                "追问 + FAQ/文档上下文：结合最近对话生成回答（事实仍只依据参考知识）",
+            )
+        elif _is_structured_faq(top):
+            strategy = "faq_grounded"
+            _log(
+                "策略",
+                "FAQ 命中（含口语改写软命中）：模型依据标准答润色，不足则说明暂无相关信息",
+            )
+        else:
+            _log("策略", "文档 RAG + 结合最近对话生成回答")
+
+        chain = self.prompt | self.llm
+        response = chain.invoke(
+            {
+                "context": context,
+                "dialogue": dialogue,
+                "question": search_query,
+            }
+        )
+        answer = response.content if hasattr(response, "content") else str(response)
+        self._mark_answered()
+
+        _log("模型原始返回", str(answer))
+        return ChatResult(
+            answer=str(answer),
+            sources=sources[:1] if strategy == "faq_grounded" else sources,
+            images=images,
+            route="faq",
+            strategy=strategy,
+            faq_id=top_faq_id if _is_structured_faq(top) else None,
+            top_score=top_score,
+        )
+
     def _reset_auto_handoff_counters(self) -> None:
         self.consecutive_no_answer = 0
         self.repeat_count = 0
@@ -451,9 +763,11 @@ class CustomerServiceBot:
             )
 
         dialogue = format_history_for_rewrite(history)
-        search_query = user_message.strip()
-        resolve_method = "original"
         use_intent = bool(self.settings.intent_llm)
+
+        import src.skills  # noqa: F401 — register built-in skills
+        from src.skills.base import SkillContext
+        from src.skills.runner import dispatch_intent_route, dispatch_legacy_route
 
         if use_intent:
             intent = classify_intent(
@@ -470,385 +784,45 @@ class CustomerServiceBot:
                     f"primary={intent.primary} route={route_name}\n"
                     + "\n".join(intent_lines),
                 )
-
-                if route_name == "handoff":
-                    self.last_clarify_options = []
-                    self._reset_auto_handoff_counters()
-                    answer = handoff_reply()
-                    _log("结果", "意图=转人工。")
-                    return ChatResult(
-                        answer=answer, route="handoff", strategy="intent"
-                    )
-
-                if route_name == "chitchat":
-                    self.last_clarify_options = []
-                    self._mark_answered()
-                    answer = chitchat_reply()
-                    _log("结果", "意图=闲聊，跳过检索。")
-                    return ChatResult(
-                        answer=answer, route="chitchat", strategy="intent"
-                    )
-
-                if route_name == "order_query":
-                    flow = self.order_flow.handle(user_message, force=True)
-                    if flow.handled:
-                        self.last_clarify_options = []
-                        self._mark_answered()
-                        _log(
-                            "多轮流程",
-                            f"flow=order_query strategy={flow.strategy} "
-                            f"state={self.order_flow.state} (intent)",
-                        )
-                        _log("模型原始返回", f"（未调用模型）\n{flow.answer}")
-                        return ChatResult(
-                            answer=flow.answer,
-                            route="flow",
-                            strategy=flow.strategy,
-                        )
-
-                if route_name == "ticket_create":
-                    flow = self.ticket_flow.handle(user_message, force=True)
-                    if flow.handled:
-                        self.last_clarify_options = []
-                        self._mark_answered()
-                        _log(
-                            "多轮流程",
-                            f"flow=ticket_create strategy={flow.strategy} "
-                            f"state={self.ticket_flow.state} (intent)",
-                        )
-                        _log("模型原始返回", f"（未调用模型）\n{flow.answer}")
-                        return ChatResult(
-                            answer=flow.answer,
-                            route="flow",
-                            strategy=flow.strategy,
-                        )
-
-                # faq / unknown → retrieval with intent search queries
-                queries = intent.faq_queries
-                if not queries:
-                    # Follow-up rewrite then single query
-                    search_query, resolve_method = resolve_search_query(
-                        self.llm,
-                        user_message,
-                        history,
-                        last_topic=self.last_topic,
-                    )
-                    queries = [search_query]
-                else:
-                    resolve_method = "intent"
-                    search_query = " | ".join(queries)
-                    _log("检索问句(意图)", search_query)
-
-                if not vectorstore_exists(self.settings):
-                    _log("结果", "向量库不存在，未调用模型。")
-                    return ChatResult(
-                        answer="知识库尚未初始化，请先重建知识库。",
-                        route="uninit",
-                        strategy="fixed",
-                    )
-
-                docs, candidates, route = self._search_faq_multi(queries)
-            else:
-                _log(
-                    "意图识别",
-                    f"失败，回退规则分流：{intent.error or 'unknown'}",
+                ctx = SkillContext(
+                    bot=self,
+                    user_message=user_message,
+                    dialogue=dialogue,
+                    history=history,
+                    intent=intent,
+                    route_name=route_name,
                 )
-                use_intent = False
+                result = dispatch_intent_route(ctx)
+                self._log_skill_result(result)
+                return result
 
-        if not use_intent:
-            # Legacy: keyword flows → chitchat → single FAQ search
-            flow, flow_name, flow_state = self._try_idle_flows(user_message)
-            if flow is not None and flow.handled:
-                self.last_clarify_options = []
-                self._mark_answered()
-                _log(
-                    "多轮流程",
-                    f"flow={flow_name} strategy={flow.strategy} state={flow_state}",
-                )
-                _log("模型原始返回", f"（未调用模型）\n{flow.answer}")
-                return ChatResult(
-                    answer=flow.answer,
-                    route="flow",
-                    strategy=flow.strategy,
-                )
-
-            if is_chitchat(user_message):
-                self.last_clarify_options = []
-                self._mark_answered()
-                answer = chitchat_reply()
-                _log("结果", "命中闲聊白名单，跳过向量检索。")
-                return ChatResult(
-                    answer=answer, route="chitchat", strategy="fixed"
-                )
-
-            if not vectorstore_exists(self.settings):
-                _log("结果", "向量库不存在，未调用模型。")
-                return ChatResult(
-                    answer="知识库尚未初始化，请先重建知识库。",
-                    route="uninit",
-                    strategy="fixed",
-                )
-
-            search_query, resolve_method = resolve_search_query(
-                self.llm,
-                user_message,
-                history,
-                last_topic=self.last_topic,
-            )
-            if resolve_method == "original":
-                _log("追问改写", "未改写（完整问句或不像追问）")
-            else:
-                _log(
-                    "追问改写",
-                    f"method={resolve_method}\n原文：{user_message}\n检索问句：{search_query}"
-                    + (
-                        f"\nlast_topic：{self.last_topic}"
-                        if self.last_topic
-                        else ""
-                    ),
-                )
-            docs, candidates, route = search_faq(
-                self.settings, search_query, k=self.settings.top_k
+            _log(
+                "意图识别",
+                f"失败，回退规则分流：{intent.error or 'unknown'}",
             )
 
-        _log(
-            "检索路由",
-            {
-                "faq": "采用 FAQ（意图→混合检索"
-                + ("+精排" if self.settings.rerank_enabled else "")
-                + "）",
-                "none": "FAQ 未命中",
-            }.get(route, route),
+        ctx = SkillContext(
+            bot=self,
+            user_message=user_message,
+            dialogue=dialogue,
+            history=history,
         )
-        if docs and (docs[0].metadata or {}).get("_retrieve_debug"):
-            _log("混合检索", str((docs[0].metadata or {}).get("_retrieve_debug")))
+        result = dispatch_legacy_route(ctx)
+        self._log_skill_result(result)
+        return result
 
-        clarify_th = self.settings.clarify_threshold
-        direct_th = self.settings.direct_threshold
-        if candidates:
-            score_lines = []
-            for i, (score, label, doc_type) in enumerate(candidates, 1):
-                if (
-                    "[精排" in label
-                    or "[未进精排]" in label
-                    or "[无关键词" in label
-                ):
-                    mark = "[已过滤]"
-                elif score < clarify_th:
-                    mark = "[丢弃:低于澄清阈值]"
-                elif doc_type == "faq" and score >= direct_th:
-                    mark = "[FAQ可直出]"
-                elif score >= clarify_th:
-                    mark = "[澄清区间/可采用]"
-                else:
-                    mark = ""
-                score_lines.append(
-                    f"  {i}. score={score:.4f} type={doc_type}  {label}  {mark}"
-                )
+    def _log_skill_result(self, result: ChatResult) -> None:
+        skills = result.skill_trace or []
+        if skills:
+            _log("技能轨迹", " → ".join(skills))
+        if result.route == "flow":
             _log(
-                "检索候选（"
-                f"澄清阈值={clarify_th}, 直出阈值={direct_th}；实际采用={route}）",
-                "\n".join(score_lines),
+                "多轮流程",
+                f"strategy={result.strategy}",
             )
-        else:
-            _log("检索候选", "向量库无结果。")
-
-        if not docs or route == "none":
-            self.last_clarify_options = []
-            self.consecutive_no_answer += 1
-            no_th = handoff_after_no_answer()
-            _log(
-                "检索结果",
-                f"FAQ/手册均无片段达到澄清阈值 {clarify_th}。"
-                f"（连续无答案 {self.consecutive_no_answer}/{no_th}）",
-            )
-            if self.consecutive_no_answer >= no_th:
-                self._reset_auto_handoff_counters()
-                answer = auto_handoff_reply("no_answer")
-                _log("结果", f"连续无答案 {no_th} 次，自动转人工。")
-                return ChatResult(
-                    answer=answer, route="handoff", strategy="auto_no_answer"
-                )
-            answer = no_knowledge_reply()
-            return ChatResult(answer=answer, route="none", strategy="reject")
-
-        # Remember topic for next-turn follow-ups (not used as answer knowledge).
-        topic = topic_from_docs(docs)
-        if topic:
-            self.last_topic = topic
-
-        sources: list[str] = []
-        chunk_logs: list[str] = []
-        for i, doc in enumerate(docs, 1):
-            source = doc.metadata.get("source", "未知来源")
-            doc_type = doc.metadata.get("doc_type", "")
-            score = doc.metadata.get("score", "")
-            score_text = f"{float(score):.4f}" if score != "" else "?"
-            faq_id = doc.metadata.get("faq_id", "")
-            question = doc.metadata.get("question", "")
-            match_text = doc.metadata.get("match_text", "")
-            phrase_role = doc.metadata.get("phrase_role", "")
-            images = doc.metadata.get("images") or []
-            if isinstance(images, str):
-                images = [images] if images else []
-            if source not in sources:
-                sources.append(source)
-            name = Path(str(source)).name
-            head = (
-                f"[片段 {i}] score={score_text} type={doc_type} "
-                f"source={name} images={len(images)}"
-            )
-            if faq_id:
-                head += f" faq_id={faq_id}"
-            if phrase_role:
-                head += f" hit={phrase_role}:{match_text or doc.page_content}"
-            body = (
-                f"Q: {question}\nA: {doc.metadata.get('answer', '')}"
-                if _is_structured_faq(doc)
-                else doc.page_content
-            )
-            chunk_logs.append(f"{head}\n{body}")
-        _log("采用的参考知识", "\n\n".join(chunk_logs))
-
-        top = docs[0]
-        top_score = float(top.metadata.get("score") or 0.0)
-        top_faq_id = str(top.metadata.get("faq_id") or "") or None
-        dialogue = format_history_for_rewrite(history)
-        has_prior = bool(dialogue and dialogue != "（无）")
-        is_followup = resolve_method != "original" or looks_like_followup(
-            user_message, has_context=has_prior
-        )
-        faq_docs = _unique_faq_docs(docs)
-        multi_faq = len(faq_docs) >= 2
-
-        # High-score FAQ: blind direct only when single near-match (not multi-intent).
-        can_direct = _faq_can_direct(user_message, top)
-        if (
-            _is_structured_faq(top)
-            and top_score >= direct_th
-            and not is_followup
-            and can_direct
-            and not multi_faq
-        ):
-            answer = str(top.metadata.get("answer") or "").strip()
-            _log(
-                "策略",
-                f"FAQ 直出（score={top_score:.4f} >= {direct_th}，问句近匹配）",
-            )
-            _log("模型原始返回", f"（未调用模型）\n{answer}")
-            self.last_clarify_options = []
-            self._mark_answered()
-            return ChatResult(
-                answer=answer,
-                sources=sources[:1],
-                route="faq",
-                strategy="direct",
-                faq_id=top_faq_id,
-                top_score=top_score,
-            )
-
-        # Legacy path only: mid-score clarify when hybrid off.
-        # Hybrid on → prefer RAG / 多 FAQ 综合，避免口语改写被「请选序号」打断。
-        if (
-            not self.settings.hybrid_search
-            and _is_structured_faq(top)
-            and top_score < direct_th
-            and not is_followup
-        ):
-            options = _clarify_options(faq_docs or docs, self.settings.clarify_count)
-            answer = _format_clarify(options)
-            self.last_clarify_options = options
-            self._mark_answered()
-            _log(
-                "策略",
-                f"FAQ 澄清（{clarify_th} <= score={top_score:.4f} < {direct_th}）"
-                f"；候选={len(options)}",
-            )
-            _log("模型原始返回", f"（未调用模型）\n{answer}")
-            return ChatResult(
-                answer=answer,
-                sources=sources,
-                route="faq",
-                strategy="clarify",
-                faq_id=top_faq_id,
-                top_score=top_score,
-                clarify_options=options,
-            )
-
-        # Near-miss high-score FAQ: ground on top FAQ only, let model refuse.
-        self.last_clarify_options = []
-        gen_docs = docs
-        if multi_faq:
-            gen_docs = faq_docs
-        elif _is_structured_faq(top) and top_score >= direct_th and not can_direct:
-            gen_docs = [top]
-
-        context = _context_from_docs(gen_docs)
-        if not context.strip():
-            self.consecutive_no_answer += 1
-            no_th = handoff_after_no_answer()
-            answer = no_knowledge_reply()
-            _log("检索结果", "内容为空，未调用模型。")
-            if self.consecutive_no_answer >= no_th:
-                self._reset_auto_handoff_counters()
-                answer = auto_handoff_reply("no_answer")
-                return ChatResult(
-                    answer=answer, route="handoff", strategy="auto_no_answer"
-                )
-            return ChatResult(answer=answer, route=route, strategy="reject")
-
-        images = _collect_images(gen_docs)
-        if images:
-            _log("关联配图", "\n".join(f"  - {p}" for p in images))
-        else:
-            _log("关联配图", "无")
-
-        strategy = "rag"
-        if multi_faq:
-            strategy = "synthesize"
-            _log(
-                "策略",
-                f"多 FAQ 综合润色（{len(faq_docs)} 条相关知识，模型合并作答）",
-            )
-        elif _is_structured_faq(top) and top_score >= direct_th and not can_direct:
-            strategy = "faq_grounded"
-            _log(
-                "策略",
-                "FAQ 高分但非近匹配：模型核对是否真正答到问题；不足则说明暂无相关信息",
-            )
-        elif _is_structured_faq(top) and is_followup:
-            strategy = "rag_followup"
-            _log(
-                "策略",
-                "追问 + FAQ/文档上下文：结合最近对话生成回答（事实仍只依据参考知识）",
-            )
-        elif _is_structured_faq(top):
-            strategy = "faq_grounded"
-            _log(
-                "策略",
-                "FAQ 命中（含口语改写软命中）：模型依据标准答润色，不足则说明暂无相关信息",
-            )
-        else:
-            _log("策略", "文档 RAG + 结合最近对话生成回答")
-
-        chain = self.prompt | self.llm
-        response = chain.invoke(
-            {
-                "context": context,
-                "dialogue": dialogue,
-                "question": search_query,
-            }
-        )
-        answer = response.content if hasattr(response, "content") else str(response)
-        self._mark_answered()
-
-        _log("模型原始返回", str(answer))
-        return ChatResult(
-            answer=str(answer),
-            sources=sources[:1] if strategy == "faq_grounded" else sources,
-            images=images,
-            route="faq",
-            strategy=strategy,
-            faq_id=top_faq_id if _is_structured_faq(top) else None,
-            top_score=top_score,
-        )
+            _log("模型原始返回", f"（未调用模型）\n{result.answer}")
+        elif result.route in {"handoff", "chitchat"} and result.strategy in {
+            "intent",
+            "fixed",
+        }:
+            _log("结果", f"route={result.route} strategy={result.strategy}")
