@@ -1,19 +1,57 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { computed, onMounted, reactive, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
+import { Delete, Edit } from '@element-plus/icons-vue'
 import {
+  createDifyApiKey,
+  deleteDifyApiKey,
   getFeishuChannel,
+  listDifyApiKeys,
+  updateDifyApiKey,
   updateFeishuChannel,
+  type DifyApiKeyItem,
   type FeishuChannel,
   type FeishuChannelUpdateBody,
 } from '@/api/channels'
 import { ApiError } from '@/api/client'
+import { isOps } from '@/auth/session'
 
 const loading = ref(false)
 const saving = ref(false)
 const formRef = ref<FormInstance>()
 const meta = ref<FeishuChannel | null>(null)
+
+const showDify = computed(() => isOps())
+const difyLoading = ref(false)
+const difySaving = ref(false)
+const difyItems = ref<DifyApiKeyItem[]>([])
+const retrievalPath = ref('/retrieval')
+
+const createVisible = ref(false)
+const createFormRef = ref<FormInstance>()
+const createForm = reactive({
+  name: '',
+  endpoint: '',
+  knowledge_id: 'faq',
+})
+const createRules: FormRules = {
+  name: [{ required: true, message: '请输入名称', trigger: 'blur' }],
+  endpoint: [{ required: true, message: '请输入 API Endpoint', trigger: 'blur' }],
+  knowledge_id: [{ required: true, message: '请输入外部知识库 ID', trigger: 'blur' }],
+}
+
+const editVisible = ref(false)
+const editFormRef = ref<FormInstance>()
+const editId = ref('')
+const editForm = reactive({
+  name: '',
+  endpoint: '',
+  knowledge_id: '',
+})
+
+const generatedKeyVisible = ref(false)
+const generatedKey = ref('')
 
 const form = reactive({
   enabled: false,
@@ -47,6 +85,16 @@ function applyMeta(data: FeishuChannel) {
   form.encrypt_key = ''
 }
 
+function formatDate(ts: number | null | undefined) {
+  if (!ts) return '—'
+  const d = new Date(ts * 1000)
+  if (Number.isNaN(d.getTime())) return '—'
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
 async function loadCurrent() {
   loading.value = true
   try {
@@ -55,6 +103,20 @@ async function loadCurrent() {
     ElMessage.error(err instanceof ApiError ? err.message : '加载失败')
   } finally {
     loading.value = false
+  }
+}
+
+async function loadDify() {
+  if (!showDify.value) return
+  difyLoading.value = true
+  try {
+    const data = await listDifyApiKeys()
+    difyItems.value = data.items || []
+    retrievalPath.value = data.retrieval_path || '/retrieval'
+  } catch (err) {
+    ElMessage.error(err instanceof ApiError ? err.message : '加载 Dify 配置失败')
+  } finally {
+    difyLoading.value = false
   }
 }
 
@@ -81,8 +143,103 @@ async function onSave() {
   }
 }
 
+function openCreate() {
+  createForm.name = ''
+  createForm.endpoint = ''
+  createForm.knowledge_id = 'faq'
+  createVisible.value = true
+}
+
+async function onCreateSubmit() {
+  const ok = await createFormRef.value?.validate().catch(() => false)
+  if (!ok) return
+  difySaving.value = true
+  try {
+    const created = await createDifyApiKey({
+      name: createForm.name.trim(),
+      endpoint: createForm.endpoint.trim(),
+      knowledge_id: createForm.knowledge_id.trim() || 'faq',
+    })
+    createVisible.value = false
+    await loadDify()
+    const key = (created.api_key || '').trim()
+    if (!key) {
+      ElMessage.error('未返回密钥，请重试')
+      return
+    }
+    generatedKey.value = key
+    generatedKeyVisible.value = true
+  } catch (err) {
+    ElMessage.error(err instanceof ApiError ? err.message : '生成失败')
+  } finally {
+    difySaving.value = false
+  }
+}
+
+function openEdit(row: DifyApiKeyItem) {
+  editId.value = row.id
+  editForm.name = row.name
+  editForm.endpoint = row.endpoint
+  editForm.knowledge_id = row.knowledge_id
+  editVisible.value = true
+}
+
+async function onEditSubmit() {
+  const ok = await editFormRef.value?.validate().catch(() => false)
+  if (!ok) return
+  difySaving.value = true
+  try {
+    await updateDifyApiKey(editId.value, {
+      name: editForm.name.trim(),
+      endpoint: editForm.endpoint.trim(),
+      knowledge_id: editForm.knowledge_id.trim(),
+    })
+    editVisible.value = false
+    ElMessage.success('已更新')
+    await loadDify()
+  } catch (err) {
+    ElMessage.error(err instanceof ApiError ? err.message : '更新失败')
+  } finally {
+    difySaving.value = false
+  }
+}
+
+async function onDelete(row: DifyApiKeyItem) {
+  try {
+    await ElMessageBox.confirm(
+      `删除「${row.name}」后，使用该 Key 的 Dify 将无法检索。确认？`,
+      '删除配置',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  difySaving.value = true
+  try {
+    await deleteDifyApiKey(row.id)
+    ElMessage.success('已删除')
+    await loadDify()
+  } catch (err) {
+    ElMessage.error(err instanceof ApiError ? err.message : '删除失败')
+  } finally {
+    difySaving.value = false
+  }
+}
+
+async function copyGeneratedKey() {
+  const key = generatedKey.value
+  if (!key) return
+  try {
+    await navigator.clipboard.writeText(key)
+    ElMessage.success('已复制到剪贴板')
+  } catch {
+    ElMessage.warning('复制失败，请手动选中复制')
+  }
+}
+
 onMounted(() => {
   void loadCurrent()
+  void loadDify()
 })
 </script>
 
@@ -164,10 +321,6 @@ onMounted(() => {
           </el-form-item>
           <el-form-item label="App ID" prop="app_id">
             <el-input v-model="form.app_id" placeholder="cli_xxxxxxxx" clearable />
-            <div class="field-hint">
-              开发者后台 → 企业自建应用 →「凭证与基础信息」→ 应用凭证中的 App ID。
-              若要释放给他人绑定，请清空 App ID 后保存。
-            </div>
           </el-form-item>
           <el-form-item label="App Secret">
             <el-input
@@ -178,9 +331,6 @@ onMounted(() => {
                 meta?.app_secret_set ? '已配置，留空则不修改' : '飞书应用 Secret'
               "
             />
-            <div class="field-hint">
-              与 App ID 同一页；启用保存时会向飞书校验是否有效。
-            </div>
           </el-form-item>
           <el-form-item label="Verification Token">
             <el-input
@@ -193,9 +343,6 @@ onMounted(() => {
                   : '事件与回调 → 加密策略'
               "
             />
-            <div class="field-hint">
-              「事件与回调」→「加密策略」中的 Verification Token，用于校验事件来源。
-            </div>
           </el-form-item>
           <el-form-item label="Encrypt Key">
             <el-input
@@ -208,25 +355,141 @@ onMounted(() => {
                   : '建议开启；开启后必填'
               "
             />
-            <div class="field-hint">
-              同在「加密策略」；建议开启。后台开启后本页必须填写相同 Key。
-            </div>
           </el-form-item>
           <el-form-item label="回调地址">
             <el-input model-value="/webhooks/feishu" readonly />
-            <div class="field-hint">
-              飞书「请求地址」填：
-              <code>https://&lt;公网域名&gt;/webhooks/feishu</code>
-              （须 HTTPS，ngrok 指到主 API）。服务端用你填写的 App ID / Token
-              自动匹配配置，不必再带 config_id。
-            </div>
           </el-form-item>
         </el-form>
       </el-tab-pane>
+
+      <el-tab-pane v-if="showDify" label="Dify" name="dify">
+        <div v-loading="difyLoading">
+          <div class="toolbar">
+            <div>
+              <h2>Dify 外部知识库</h2>
+              <p class="sub">
+                可创建多把 API Key。新建时填写名称、Endpoint、知识库 ID，生成后明文仅展示一次。
+                Dify 请求路径为
+                <code>{{ retrievalPath }}</code>
+                （Endpoint 填公网根地址，不要带该路径）。本期检索均走本服务 FAQ。
+              </p>
+            </div>
+            <div class="actions">
+              <el-button @click="loadDify">重新加载</el-button>
+              <el-button type="primary" @click="openCreate">新建</el-button>
+            </div>
+          </div>
+
+          <el-table :data="difyItems" stripe empty-text="暂无配置，点击右上角新建">
+            <el-table-column prop="name" label="名称" min-width="120" />
+            <el-table-column prop="api_key_masked" label="Key" min-width="200">
+              <template #default="{ row }">
+                <code class="key-mask">{{ row.api_key_masked }}</code>
+              </template>
+            </el-table-column>
+            <el-table-column prop="endpoint" label="API Endpoint" min-width="200" show-overflow-tooltip />
+            <el-table-column prop="knowledge_id" label="知识库 ID" width="120" />
+            <el-table-column label="创建日期" width="120">
+              <template #default="{ row }">
+                {{ formatDate(row.created_at) }}
+              </template>
+            </el-table-column>
+            <el-table-column label="最新使用" width="120">
+              <template #default="{ row }">
+                {{ formatDate(row.last_used_at) }}
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="100" fixed="right">
+              <template #default="{ row }">
+                <el-button link type="primary" :icon="Edit" @click="openEdit(row)" />
+                <el-button
+                  link
+                  type="danger"
+                  :icon="Delete"
+                  :loading="difySaving"
+                  @click="onDelete(row)"
+                />
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </el-tab-pane>
+
       <el-tab-pane label="企业微信" name="wecom" disabled>
         <p class="hint">即将支持</p>
       </el-tab-pane>
     </el-tabs>
+
+    <el-dialog v-model="createVisible" title="新建 Dify 配置" width="520px" destroy-on-close>
+      <el-form
+        ref="createFormRef"
+        :model="createForm"
+        :rules="createRules"
+        label-width="130px"
+      >
+        <el-form-item label="名称" prop="name">
+          <el-input v-model="createForm.name" placeholder="如 dify-生产" maxlength="64" />
+        </el-form-item>
+        <el-form-item label="API Endpoint" prop="endpoint">
+          <el-input
+            v-model="createForm.endpoint"
+            placeholder="https://xxxx.ngrok-free.app"
+          />
+          <div class="field-hint">填到 Dify 的公网根地址，不要带 /retrieval</div>
+        </el-form-item>
+        <el-form-item label="外部知识库 ID" prop="knowledge_id">
+          <el-input v-model="createForm.knowledge_id" placeholder="faq" />
+          <div class="field-hint">须与 Dify「连接外部知识库」时填写的 ID 一致</div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="createVisible = false">取消</el-button>
+        <el-button type="primary" :loading="difySaving" @click="onCreateSubmit">
+          生成
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="editVisible" title="编辑配置" width="520px" destroy-on-close>
+      <el-form
+        ref="editFormRef"
+        :model="editForm"
+        :rules="createRules"
+        label-width="130px"
+      >
+        <el-form-item label="名称" prop="name">
+          <el-input v-model="editForm.name" maxlength="64" />
+        </el-form-item>
+        <el-form-item label="API Endpoint" prop="endpoint">
+          <el-input v-model="editForm.endpoint" />
+        </el-form-item>
+        <el-form-item label="外部知识库 ID" prop="knowledge_id">
+          <el-input v-model="editForm.knowledge_id" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="editVisible = false">取消</el-button>
+        <el-button type="primary" :loading="difySaving" @click="onEditSubmit">
+          保存
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="generatedKeyVisible"
+      title="API Key 已生成"
+      width="520px"
+      :close-on-click-modal="false"
+    >
+      <p class="dialog-tip">
+        请立即复制并填到 Dify 的 API Key。关闭后无法再次查看完整密钥；需要新 Key 请再建一条。
+      </p>
+      <el-input :model-value="generatedKey" type="textarea" :rows="3" readonly />
+      <template #footer>
+        <el-button @click="generatedKeyVisible = false">关闭</el-button>
+        <el-button type="primary" @click="copyGeneratedKey">复制</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -253,12 +516,13 @@ h2 {
   margin: 0;
   color: #909399;
   font-size: 13px;
-  max-width: 560px;
+  max-width: 640px;
   line-height: 1.5;
 }
 .sub code,
 .field-hint code,
-.guide-list code {
+.guide-list code,
+.key-mask {
   font-size: 12px;
   background: #f5f7fa;
   padding: 1px 6px;
@@ -304,9 +568,6 @@ h2 {
   color: #409eff;
   text-decoration: none;
 }
-.guide-list a:hover {
-  text-decoration: underline;
-}
 .form {
   max-width: 720px;
 }
@@ -315,11 +576,18 @@ h2 {
   color: #909399;
   font-size: 12px;
   line-height: 1.45;
+  width: 100%;
 }
 .hint {
   margin-top: 16px;
   color: #909399;
   font-size: 12px;
+  line-height: 1.5;
+}
+.dialog-tip {
+  margin: 0 0 12px;
+  color: #606266;
+  font-size: 13px;
   line-height: 1.5;
 }
 </style>

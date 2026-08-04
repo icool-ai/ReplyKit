@@ -8,6 +8,7 @@ App ID / Verification Token (``id`` remains an internal primary key).
 
 from __future__ import annotations
 
+import secrets
 import sqlite3
 import time
 import uuid
@@ -21,6 +22,42 @@ from src.config import PROJECT_ROOT
 
 CHANNEL_FEISHU = "feishu"
 FEISHU_CALLBACK_PATH = "/webhooks/feishu"
+SETTING_DIFY_RETRIEVAL_API_KEY = "dify_retrieval_api_key"  # legacy single-key
+
+
+@dataclass(frozen=True)
+class DifyApiKeyRow:
+    id: str
+    name: str
+    endpoint: str
+    knowledge_id: str
+    api_key: str
+    created_at: int
+    updated_at: int
+    last_used_at: int | None
+
+    def to_public_dict(self, *, api_key_plaintext: str | None = None) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "id": self.id,
+            "name": self.name,
+            "endpoint": self.endpoint,
+            "knowledge_id": self.knowledge_id,
+            "api_key_masked": _mask_api_key(self.api_key),
+            "api_key_set": True,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "last_used_at": self.last_used_at,
+        }
+        if api_key_plaintext is not None:
+            out["api_key"] = api_key_plaintext
+        return out
+
+
+def _mask_api_key(api_key: str) -> str:
+    key = api_key.strip()
+    if len(key) <= 12:
+        return "*" * len(key) if key else ""
+    return f"{key[:10]}{'*' * max(8, len(key) - 14)}{key[-4:]}"
 
 
 class AppIdTakenError(Exception):
@@ -134,6 +171,279 @@ class ChannelStore:
                     PRIMARY KEY (config_id, open_id)
                 )
                 """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS platform_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dify_api_keys (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    endpoint TEXT NOT NULL,
+                    knowledge_id TEXT NOT NULL,
+                    api_key TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    last_used_at INTEGER
+                )
+                """
+            )
+            self._migrate_legacy_dify_key()
+
+    def _migrate_legacy_dify_key(self) -> None:
+        """One-shot: move platform_settings single key into dify_api_keys."""
+        row = self._conn.execute(
+            "SELECT value, updated_at FROM platform_settings WHERE key = ?",
+            (SETTING_DIFY_RETRIEVAL_API_KEY,),
+        ).fetchone()
+        if row is None:
+            return
+        legacy = str(row["value"] or "").strip()
+        if not legacy:
+            self._conn.execute(
+                "DELETE FROM platform_settings WHERE key = ?",
+                (SETTING_DIFY_RETRIEVAL_API_KEY,),
+            )
+            return
+        exists = self._conn.execute(
+            "SELECT 1 FROM dify_api_keys WHERE api_key = ? LIMIT 1",
+            (legacy,),
+        ).fetchone()
+        if exists is None:
+            now = int(row["updated_at"] or time.time())
+            self._conn.execute(
+                """
+                INSERT INTO dify_api_keys
+                (id, name, endpoint, knowledge_id, api_key,
+                 created_at, updated_at, last_used_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    "迁移自旧配置",
+                    "",
+                    "faq",
+                    legacy,
+                    now,
+                    now,
+                ),
+            )
+        self._conn.execute(
+            "DELETE FROM platform_settings WHERE key = ?",
+            (SETTING_DIFY_RETRIEVAL_API_KEY,),
+        )
+
+    def get_setting(self, key: str) -> tuple[str, int] | None:
+        """Return ``(value, updated_at)`` or None if missing / empty key."""
+        k = key.strip()
+        if not k:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value, updated_at FROM platform_settings WHERE key = ?",
+                (k,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["value"] or ""), int(row["updated_at"] or 0)
+
+    def set_setting(self, key: str, value: str) -> int:
+        """Upsert setting; returns updated_at."""
+        k = key.strip()
+        if not k:
+            raise ValueError("setting key 不能为空")
+        now = int(time.time())
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO platform_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (k, value, now),
+            )
+        return now
+
+    def delete_setting(self, key: str) -> bool:
+        k = key.strip()
+        if not k:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM platform_settings WHERE key = ?",
+                (k,),
+            )
+            return cur.rowcount > 0
+
+    def get_dify_retrieval_api_key(self) -> str:
+        """Deprecated single-key helper; prefer ``find_dify_api_key``."""
+        rows = self.list_dify_api_keys()
+        return rows[0].api_key if rows else ""
+
+    def list_dify_api_keys(self) -> list[DifyApiKeyRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM dify_api_keys
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [_row_to_dify_key(r) for r in rows]
+
+    def get_dify_api_key(self, key_id: str) -> DifyApiKeyRow | None:
+        kid = key_id.strip()
+        if not kid:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM dify_api_keys WHERE id = ?",
+                (kid,),
+            ).fetchone()
+        return _row_to_dify_key(row) if row else None
+
+    def find_dify_api_key_by_secret(self, api_key: str) -> DifyApiKeyRow | None:
+        provided = api_key.strip()
+        if not provided:
+            return None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM dify_api_keys"
+            ).fetchall()
+        for row in rows:
+            stored = str(row["api_key"] or "")
+            if len(stored) == len(provided) and secrets.compare_digest(
+                stored, provided
+            ):
+                return _row_to_dify_key(row)
+        return None
+
+    def create_dify_api_key(
+        self,
+        *,
+        name: str,
+        endpoint: str,
+        knowledge_id: str,
+    ) -> tuple[str, DifyApiKeyRow]:
+        n = name.strip()
+        ep = endpoint.strip().rstrip("/")
+        kid = knowledge_id.strip() or "faq"
+        if not n:
+            raise ValueError("名称不能为空")
+        if not ep:
+            raise ValueError("API Endpoint 不能为空")
+        low = ep.lower()
+        if not (low.startswith("http://") or low.startswith("https://")):
+            raise ValueError("API Endpoint 须以 http:// 或 https:// 开头")
+        if low.rstrip("/").endswith("/retrieval"):
+            raise ValueError("API Endpoint 不要带 /retrieval 后缀")
+        plaintext = f"rk_dify_{secrets.token_urlsafe(32)}"
+        now = int(time.time())
+        row_id = uuid.uuid4().hex
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO dify_api_keys
+                (id, name, endpoint, knowledge_id, api_key,
+                 created_at, updated_at, last_used_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (row_id, n, ep, kid, plaintext, now, now),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM dify_api_keys WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+        assert row is not None
+        return plaintext, _row_to_dify_key(row)
+
+    def update_dify_api_key(
+        self,
+        key_id: str,
+        *,
+        name: str | None = None,
+        endpoint: str | None = None,
+        knowledge_id: str | None = None,
+    ) -> DifyApiKeyRow:
+        kid = key_id.strip()
+        if not kid:
+            raise KeyError("配置不存在")
+        with self._lock:
+            existing_row = self._conn.execute(
+                "SELECT * FROM dify_api_keys WHERE id = ?",
+                (kid,),
+            ).fetchone()
+            if existing_row is None:
+                raise KeyError("配置不存在")
+            existing = _row_to_dify_key(existing_row)
+            new_name = existing.name if name is None else name.strip()
+            new_ep = (
+                existing.endpoint
+                if endpoint is None
+                else endpoint.strip().rstrip("/")
+            )
+            new_kid = (
+                existing.knowledge_id
+                if knowledge_id is None
+                else (knowledge_id.strip() or existing.knowledge_id)
+            )
+            if not new_name:
+                raise ValueError("名称不能为空")
+            if not new_ep:
+                raise ValueError("API Endpoint 不能为空")
+            low = new_ep.lower()
+            if not (low.startswith("http://") or low.startswith("https://")):
+                raise ValueError("API Endpoint 须以 http:// 或 https:// 开头")
+            if low.rstrip("/").endswith("/retrieval"):
+                raise ValueError("API Endpoint 不要带 /retrieval 后缀")
+            now = int(time.time())
+            self._conn.execute(
+                """
+                UPDATE dify_api_keys
+                SET name = ?, endpoint = ?, knowledge_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (new_name, new_ep, new_kid, now, existing.id),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM dify_api_keys WHERE id = ?",
+                (existing.id,),
+            ).fetchone()
+        assert row is not None
+        return _row_to_dify_key(row)
+
+    def delete_dify_api_key(self, key_id: str) -> bool:
+        kid = key_id.strip()
+        if not kid:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM dify_api_keys WHERE id = ?",
+                (kid,),
+            )
+            return cur.rowcount > 0
+
+    def touch_dify_api_key_used(self, key_id: str) -> None:
+        kid = key_id.strip()
+        if not kid:
+            return
+        now = int(time.time())
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE dify_api_keys
+                SET last_used_at = ?
+                WHERE id = ?
+                """,
+                (now, kid),
             )
 
     def close(self) -> None:
@@ -455,6 +765,20 @@ def _require_feishu_ready(app_id: str, secret: str, token: str) -> None:
         raise ValueError(
             "启用飞书渠道前请填写：" + "、".join(missing)
         )
+
+
+def _row_to_dify_key(row: sqlite3.Row) -> DifyApiKeyRow:
+    last_used = row["last_used_at"]
+    return DifyApiKeyRow(
+        id=str(row["id"]),
+        name=str(row["name"] or ""),
+        endpoint=str(row["endpoint"] or ""),
+        knowledge_id=str(row["knowledge_id"] or ""),
+        api_key=str(row["api_key"] or ""),
+        created_at=int(row["created_at"] or 0),
+        updated_at=int(row["updated_at"] or 0),
+        last_used_at=int(last_used) if last_used is not None else None,
+    )
 
 
 def _row_to_config(row: sqlite3.Row) -> ChannelConfigRow:

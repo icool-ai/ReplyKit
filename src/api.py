@@ -4,16 +4,20 @@ Share the same ``CustomerServiceBot`` logic as the Vue front-end / external clie
 Sessions persist in SQLite (``SESSION_DB_PATH``).
 Images are exposed as ``/assets/...`` URLs (P2-4).
 Auth: JWT Bearer after ``POST /auth/login`` (no X-API-Key).
+Dify external knowledge: ``POST /retrieval`` authenticates against keys from
+ops ``GET/POST /integrations/dify/keys*`` and returns Dify-native JSON.
 
 JSON responses use a unified envelope: ``{code, message, data}``.
-File download responses (e.g. FAQ templates) remain raw binary.
+File download responses (e.g. FAQ templates) and Dify ``/retrieval`` remain
+raw / protocol-specific.
 """
 from __future__ import annotations
 
 import json
-import os
-import threading
 import logging
+import os
+import secrets
+import threading
 import uuid
 from typing import Any
 
@@ -30,7 +34,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
@@ -78,6 +82,10 @@ from src.channels.wecom import (
 from src.chat_log import ChatLogStore, log_turn_safe
 from src.chatbot import CustomerServiceBot
 from src.config import Settings, get_settings
+from src.dify_retrieval import (
+    dify_error,
+    docs_to_records,
+)
 from src.skills.base import ChannelContext
 from src.faq_import import (
     SUPPORTED_FORMATS,
@@ -94,8 +102,10 @@ from src.faq_store import (
 )
 from src.knowledge import (
     delete_faq_vectors,
+    search_faq,
     sync_faq_ids,
     upsert_faq_ids,
+    vectorstore_exists,
 )
 from src.retrieve import invalidate_bm25_cache
 from src.sensitive_store import (
@@ -412,6 +422,52 @@ class FeishuChannelUpdateRequest(BaseModel):
     )
 
 
+class DifyApiKeyItem(BaseModel):
+    id: str
+    name: str
+    endpoint: str
+    knowledge_id: str
+    api_key_masked: str
+    api_key_set: bool = True
+    created_at: int
+    updated_at: int
+    last_used_at: int | None = None
+    api_key: str | None = Field(
+        default=None,
+        description="仅新建时返回一次明文",
+    )
+
+
+class DifyApiKeyListData(BaseModel):
+    items: list[DifyApiKeyItem]
+    retrieval_path: str = "/retrieval"
+
+
+class DifyApiKeyCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="配置名称")
+    endpoint: str = Field(
+        ...,
+        min_length=1,
+        description="填到 Dify 的公网根地址（不要带 /retrieval）",
+    )
+    knowledge_id: str = Field(
+        default="faq",
+        description="外部知识库 ID；与 Dify 连接时填写的一致",
+    )
+
+
+class DifyApiKeyUpdateRequest(BaseModel):
+    name: str | None = None
+    endpoint: str | None = None
+    knowledge_id: str | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one(self) -> DifyApiKeyUpdateRequest:
+        if self.name is None and self.endpoint is None and self.knowledge_id is None:
+            raise ValueError("至少需要更新一个字段")
+        return self
+
+
 class SensitiveItem(BaseModel):
     id: str
     pattern: str
@@ -553,9 +609,11 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             "鉴权：POST /auth/login 换 JWT（含 role）；"
             "Authorization: Bearer <access_token>。"
             "公开：/health、企微/飞书回调、飞书 OAuth 回调、"
-            "/auth/login、/auth/register、/auth/refresh。"
+            "/auth/login、/auth/register、/auth/refresh；"
+            "POST /retrieval（Dify 外部知识库，Bearer=平台配置的 API Key，原生 JSON）。"
             "普通用户：/chat、/sessions*、GET /bot-scripts、/channels/feishu*；"
-            "运营 ops：/faqs*、/sensitive-words*、POST /bot-scripts*、/users*。"
+            "运营 ops：/faqs*、/sensitive-words*、POST /bot-scripts*、/users*、"
+            "GET/POST /integrations/dify/keys*。"
             "POST /chat；GET /sessions；"
             "POST /faqs、/faqs/list…；POST /users、/users/list、/users/update、/users/reset-password；"
             "GET /bot-scripts（登录可读）；POST /bot-scripts*（ops）；"
@@ -783,6 +841,137 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health", response_model=ApiResponse[HealthData])
     def health() -> dict[str, Any]:
         return ok(HealthData(status="ok").model_dump())
+
+    @app.post("/retrieval")
+    async def dify_retrieval(
+        request: Request,
+        bearer: HTTPAuthorizationCredentials | None = Security(_bearer_scheme),
+    ) -> JSONResponse:
+        """Dify 外部知识库检索：原生 ``{"records":[...]}``，不用统一信封。"""
+        if not bearer or not bearer.credentials:
+            return JSONResponse(
+                status_code=401,
+                content=dify_error(
+                    error_code=1001,
+                    error_msg="无效的 Authorization 请求头格式",
+                ),
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        provided = bearer.credentials.strip()
+        key_row = channel_store.find_dify_api_key_by_secret(provided)
+        if key_row is None:
+            # 区分「未配置任何 Key」与「Key 错误」
+            if not channel_store.list_dify_api_keys():
+                return JSONResponse(
+                    status_code=401,
+                    content=dify_error(
+                        error_code=1002,
+                        error_msg="未在平台配置 Dify API Key（渠道配置 → Dify）",
+                    ),
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            return JSONResponse(
+                status_code=401,
+                content=dify_error(
+                    error_code=1002,
+                    error_msg="认证失败，请检查 API Key",
+                ),
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=400,
+                content=dify_error(
+                    error_code=2002,
+                    error_msg="请求体须为 JSON",
+                ),
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                status_code=400,
+                content=dify_error(
+                    error_code=2002,
+                    error_msg="请求体须为 JSON 对象",
+                ),
+            )
+
+        knowledge_id = str(body.get("knowledge_id") or "").strip()
+        query = str(body.get("query") or "").strip()
+        retrieval_setting = body.get("retrieval_setting")
+        if not isinstance(retrieval_setting, dict):
+            return JSONResponse(
+                status_code=400,
+                content=dify_error(
+                    error_code=2002,
+                    error_msg="缺少必填字段 retrieval_setting",
+                ),
+            )
+        # Dify 保存 API 时会发 knowledge_id="" / query="" 探测；须 200 + records
+        if not query:
+            return JSONResponse(status_code=200, content={"records": []})
+        if not knowledge_id:
+            return JSONResponse(
+                status_code=400,
+                content=dify_error(
+                    error_code=2002,
+                    error_msg="缺少必填字段 knowledge_id",
+                ),
+            )
+        if knowledge_id != key_row.knowledge_id:
+            return JSONResponse(
+                status_code=404,
+                content=dify_error(
+                    error_code=2001,
+                    error_msg="知识库不存在或与该 API Key 不匹配",
+                ),
+            )
+
+        try:
+            top_k = int(retrieval_setting.get("top_k"))
+            score_threshold = float(retrieval_setting.get("score_threshold"))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                status_code=400,
+                content=dify_error(
+                    error_code=2002,
+                    error_msg="retrieval_setting.top_k / score_threshold 无效",
+                ),
+            )
+        if top_k < 1:
+            top_k = 1
+        if score_threshold < 0:
+            score_threshold = 0.0
+
+        if not vectorstore_exists(settings):
+            return JSONResponse(
+                status_code=500,
+                content=dify_error(
+                    error_code=5000,
+                    error_msg="向量库未初始化，请先导入 FAQ 并重建索引",
+                ),
+            )
+
+        try:
+            docs, _cands, _route = search_faq(settings, query, k=top_k)
+            records = docs_to_records(
+                docs,
+                score_threshold=score_threshold,
+                top_k=top_k,
+            )
+            channel_store.touch_dify_api_key_used(key_row.id)
+        except Exception as exc:  # noqa: BLE001 — surface to Dify as protocol error
+            logging.getLogger(__name__).exception("dify /retrieval failed")
+            return JSONResponse(
+                status_code=500,
+                content=dify_error(
+                    error_code=5000,
+                    error_msg=f"检索失败：{exc}",
+                ),
+            )
+        return JSONResponse(status_code=200, content={"records": records})
 
     @app.get("/webhooks/wecom")
     def wecom_verify(
@@ -1762,6 +1951,78 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
         if row is None:
             return ok(_empty_feishu(owner))
         return ok(_feishu_public(row))
+
+    @app.get(
+        "/integrations/dify/keys",
+        response_model=ApiResponse[DifyApiKeyListData],
+    )
+    def integrations_dify_keys_list(
+        _: dict[str, Any] = Depends(require_ops),
+    ) -> dict[str, Any]:
+        items = [
+            DifyApiKeyItem(**row.to_public_dict()).model_dump()
+            for row in channel_store.list_dify_api_keys()
+        ]
+        return ok({"items": items, "retrieval_path": "/retrieval"})
+
+    @app.post(
+        "/integrations/dify/keys",
+        response_model=ApiResponse[DifyApiKeyItem],
+    )
+    def integrations_dify_keys_create(
+        req: DifyApiKeyCreateRequest,
+        _: dict[str, Any] = Depends(require_ops),
+    ) -> dict[str, Any]:
+        try:
+            with channel_lock:
+                plaintext, row = channel_store.create_dify_api_key(
+                    name=req.name,
+                    endpoint=req.endpoint,
+                    knowledge_id=req.knowledge_id,
+                )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return ok(
+            row.to_public_dict(api_key_plaintext=plaintext),
+            message="已生成 API Key，请立即复制",
+        )
+
+    @app.post(
+        "/integrations/dify/keys/{key_id}/update",
+        response_model=ApiResponse[DifyApiKeyItem],
+    )
+    def integrations_dify_keys_update(
+        key_id: str,
+        req: DifyApiKeyUpdateRequest,
+        _: dict[str, Any] = Depends(require_ops),
+    ) -> dict[str, Any]:
+        try:
+            with channel_lock:
+                row = channel_store.update_dify_api_key(
+                    key_id,
+                    name=req.name,
+                    endpoint=req.endpoint,
+                    knowledge_id=req.knowledge_id,
+                )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return ok(row.to_public_dict(), message="已更新")
+
+    @app.post(
+        "/integrations/dify/keys/{key_id}/delete",
+        response_model=ApiResponse[bool],
+    )
+    def integrations_dify_keys_delete(
+        key_id: str,
+        _: dict[str, Any] = Depends(require_ops),
+    ) -> dict[str, Any]:
+        with channel_lock:
+            deleted = channel_store.delete_dify_api_key(key_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="配置不存在")
+        return ok(True, message="已删除")
 
     @app.post(
         "/channels/feishu/update",
