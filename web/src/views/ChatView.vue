@@ -1,17 +1,33 @@
 <script setup lang="ts">
-import { nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { listEnabledAgents, type AgentItem } from '@/api/agents'
 import { getBotScripts } from '@/api/botScripts'
 import { postChat } from '@/api/chat'
 import { ApiError } from '@/api/client'
+import {
+  createCompetitorSession,
+  postCompetitorMessage,
+  streamCompetitorRun,
+  competitorDownloadHref,
+} from '@/api/competitor'
 import { deleteSession, getSession, listSessions, type SessionSummary } from '@/api/sessions'
+import { getAccessToken } from '@/auth/session'
 
 interface Bubble {
   role: 'user' | 'assistant'
   content: string
   images?: string[]
   clarifyOptions?: string[]
+  downloadUrl?: string
+  downloadName?: string
 }
+
+const AGENT_KEY = 'replykit_active_agent'
+
+const route = useRoute()
+const router = useRouter()
 
 const sessionId = ref<string | null>(null)
 const input = ref('')
@@ -21,13 +37,58 @@ const listRef = ref<HTMLElement | null>(null)
 const history = ref<SessionSummary[]>([])
 const historyLoading = ref(false)
 const welcomeText = ref('')
+const agents = ref<AgentItem[]>([])
+const activeAgentId = ref('customer_service')
 /** 视图世代：作废过期的欢迎语 / 打开会话回调，避免异步回写互相覆盖 */
 let viewEpoch = 0
+
+const isCompetitor = computed(() => activeAgentId.value === 'ecommerce_competitor')
+const activeAgentName = computed(() => {
+  const a = agents.value.find((x) => x.id === activeAgentId.value)
+  return a?.name || (isCompetitor.value ? '电商竞品分析' : '智能客服')
+})
 
 async function scrollBottom() {
   await nextTick()
   const el = listRef.value
   if (el) el.scrollTop = el.scrollHeight
+}
+
+async function loadAgents() {
+  try {
+    const data = await listEnabledAgents()
+    agents.value = data.items
+    const fromQuery = typeof route.query.agent === 'string' ? route.query.agent : ''
+    const fromStore = localStorage.getItem(AGENT_KEY) || ''
+    const preferred = fromQuery || fromStore || 'customer_service'
+    if (agents.value.some((a) => a.id === preferred)) {
+      activeAgentId.value = preferred
+    } else if (agents.value.length) {
+      activeAgentId.value = agents.value[0].id
+    }
+    localStorage.setItem(AGENT_KEY, activeAgentId.value)
+  } catch {
+    agents.value = [
+      {
+        id: 'customer_service',
+        name: '智能客服',
+        description: '',
+        icon: '',
+        category: '',
+        runtime: 'replykit_chat',
+        enabled: true,
+        sort_order: 10,
+        updated_at: 0,
+      },
+    ]
+  }
+}
+
+function onAgentChange(id: string) {
+  activeAgentId.value = id
+  localStorage.setItem(AGENT_KEY, id)
+  void router.replace({ query: { ...route.query, agent: id } })
+  void resetSession(false)
 }
 
 async function ensureWelcomeText(): Promise<string> {
@@ -43,6 +104,18 @@ async function ensureWelcomeText(): Promise<string> {
 
 async function showWelcome() {
   const epoch = ++viewEpoch
+  if (isCompetitor.value) {
+    if (epoch !== viewEpoch) return
+    messages.value = [
+      {
+        role: 'assistant',
+        content:
+          '你好，我是电商竞品分析助手。可以说：帮我分析一下 doogee 在 Amazon 上的竞品，要 5 个',
+      },
+    ]
+    await scrollBottom()
+    return
+  }
   const text = await ensureWelcomeText()
   if (epoch !== viewEpoch) return
   if (sessionId.value !== null) return
@@ -52,6 +125,10 @@ async function showWelcome() {
 }
 
 async function loadHistory() {
+  if (isCompetitor.value) {
+    history.value = []
+    return
+  }
   historyLoading.value = true
   try {
     const data = await listSessions(1, 50)
@@ -64,6 +141,7 @@ async function loadHistory() {
 }
 
 async function openSession(item: SessionSummary) {
+  if (isCompetitor.value) return
   const epoch = ++viewEpoch
   try {
     const detail = await getSession(item.session_id)
@@ -94,6 +172,67 @@ async function removeSession(item: SessionSummary, e: Event) {
   }
 }
 
+async function sendCustomer(message: string) {
+  const data = await postChat(message, sessionId.value)
+  sessionId.value = data.session_id
+  messages.value.push({
+    role: 'assistant',
+    content: data.answer,
+    images: data.images,
+    clarifyOptions: data.clarify_options,
+  })
+  await loadHistory()
+}
+
+async function sendCompetitor(message: string) {
+  if (!sessionId.value) {
+    const created = await createCompetitorSession()
+    sessionId.value = created.session_id
+  }
+  const sid = sessionId.value!
+  const run = await postCompetitorMessage(sid, message)
+  let assistantBuf = ''
+  const pushOrUpdate = (text: string, extra?: Partial<Bubble>) => {
+    const last = messages.value[messages.value.length - 1]
+    if (last && last.role === 'assistant' && last.content.startsWith('…')) {
+      last.content = text
+      if (extra?.downloadUrl) last.downloadUrl = extra.downloadUrl
+      if (extra?.downloadName) last.downloadName = extra.downloadName
+    } else {
+      messages.value.push({
+        role: 'assistant',
+        content: text,
+        ...extra,
+      })
+    }
+  }
+  messages.value.push({ role: 'assistant', content: '…分析中' })
+  await streamCompetitorRun(sid, run.run_id, (ev) => {
+    if (ev.type === 'assistant' && typeof ev.message === 'string') {
+      assistantBuf = ev.message
+      pushOrUpdate(assistantBuf)
+    } else if (ev.type === 'progress') {
+      const msg = typeof ev.message === 'string' ? ev.message : '处理中…'
+      pushOrUpdate(`…${msg}`)
+    } else if (ev.type === 'artifact') {
+      const summary = typeof ev.summary === 'string' ? ev.summary : '已生成分析结果'
+      const filename = typeof ev.filename === 'string' ? ev.filename : ''
+      const href = filename
+        ? competitorDownloadHref(filename)
+        : typeof ev.download_url === 'string'
+          ? `/api${ev.download_url}`
+          : undefined
+      pushOrUpdate(summary, {
+        downloadUrl: href,
+        downloadName: filename || 'download.csv',
+      })
+    } else if (ev.type === 'error') {
+      pushOrUpdate(`错误：${ev.message || '任务失败'}`)
+    }
+  })
+  if (assistantBuf) pushOrUpdate(assistantBuf)
+}
+
 async function send(text?: string) {
   const message = (text ?? input.value).trim()
   if (!message || loading.value) return
@@ -105,15 +244,8 @@ async function send(text?: string) {
   await scrollBottom()
 
   try {
-    const data = await postChat(message, sessionId.value)
-    sessionId.value = data.session_id
-    messages.value.push({
-      role: 'assistant',
-      content: data.answer,
-      images: data.images,
-      clarifyOptions: data.clarify_options,
-    })
-    await loadHistory()
+    if (isCompetitor.value) await sendCompetitor(message)
+    else await sendCustomer(message)
   } catch (err) {
     const msg = err instanceof ApiError ? err.message : '发送失败'
     ElMessage.error(msg)
@@ -136,15 +268,37 @@ async function resetSession(notify = true) {
   if (notify) ElMessage.success('已开启新会话')
 }
 
-onMounted(() => {
+function downloadWithAuth(url: string, name: string) {
+  const token = getAccessToken()
+  void fetch(url, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+    .then(async (res) => {
+      if (!res.ok) throw new Error('下载失败')
+      const blob = await res.blob()
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      a.download = name
+      a.click()
+      URL.revokeObjectURL(a.href)
+    })
+    .catch(() => ElMessage.error('下载失败'))
+}
+
+watch(isCompetitor, () => {
   void loadHistory()
-  void showWelcome()
+})
+
+onMounted(async () => {
+  await loadAgents()
+  await loadHistory()
+  await showWelcome()
 })
 </script>
 
 <template>
   <div class="chat-layout">
-    <aside class="history">
+    <aside v-if="!isCompetitor" class="history">
       <div class="history-head">
         <span>我的会话</span>
         <el-button size="small" @click="resetSession()">新建</el-button>
@@ -176,20 +330,50 @@ onMounted(() => {
     <div class="chat-page">
       <div class="toolbar">
         <div>
-          <h2>对话</h2>
+          <h2>对话 · {{ activeAgentName }}</h2>
           <p class="sub">
             session:
             <code>{{ sessionId || '（发送后自动生成）' }}</code>
           </p>
         </div>
-        <el-button @click="resetSession()">新会话</el-button>
+        <div class="toolbar-right">
+          <el-select
+            :model-value="activeAgentId"
+            style="width: 180px"
+            @change="onAgentChange"
+          >
+            <el-option
+              v-for="a in agents"
+              :key="a.id"
+              :label="a.name"
+              :value="a.id"
+            />
+          </el-select>
+          <el-button @click="resetSession()">新会话</el-button>
+        </div>
       </div>
 
       <div ref="listRef" class="messages">
-        <div v-if="!messages.length" class="empty">输入问题开始对话，例如「退货几天」</div>
+        <div v-if="!messages.length" class="empty">
+          {{
+            isCompetitor
+              ? '输入竞品分析需求，例如「分析 Amazon 上 doogee 竞品 5 个」'
+              : '输入问题开始对话，例如「退货几天」'
+          }}
+        </div>
         <div v-for="(m, i) in messages" :key="i" class="row" :class="m.role">
           <div class="bubble">
             <div class="text">{{ m.content }}</div>
+            <div v-if="m.downloadUrl" class="dl">
+              <el-button
+                size="small"
+                type="primary"
+                link
+                @click="downloadWithAuth(m.downloadUrl!, m.downloadName || 'export.csv')"
+              >
+                下载 CSV{{ m.downloadName ? `（${m.downloadName}）` : '' }}
+              </el-button>
+            </div>
             <div v-if="m.images?.length" class="images">
               <a
                 v-for="(url, j) in m.images"
@@ -220,7 +404,11 @@ onMounted(() => {
           v-model="input"
           type="textarea"
           :rows="2"
-          placeholder="输入消息，Enter 发送（Shift+Enter 换行）"
+          :placeholder="
+            isCompetitor
+              ? '输入竞品分析需求，Enter 发送'
+              : '输入消息，Enter 发送（Shift+Enter 换行）'
+          "
           :disabled="loading"
           @keydown.enter.exact.prevent="send()"
         />
@@ -321,6 +509,13 @@ onMounted(() => {
   justify-content: space-between;
   padding: 16px 20px;
   border-bottom: 1px solid #ebeef5;
+  gap: 12px;
+}
+
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .toolbar h2 {
@@ -369,6 +564,10 @@ onMounted(() => {
 .row.user .bubble {
   background: #ecf5ff;
   border-color: #d9ecff;
+}
+
+.dl {
+  margin-top: 8px;
 }
 
 .images {

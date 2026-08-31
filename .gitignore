@@ -10,6 +10,11 @@ data/assets/
 # 运行时 SQLite（会话 / FAQ / 敏感词 / 鉴权 / 日志等），勿提交
 *.db
 *.log
+data/competitor_artifacts/
+
+# vendor / 临时解压
+_vendor_mp_tmp/
+_mp.zip
 
 # 本地临时 / 调试产物
 _tmp_*.py
@@ -18,6 +23,7 @@ _tmp_*.py
 # 前端 (web/)
 web/node_modules/
 web/dist/
+web/dist.zip
 web/.env
 web/.env.local
 web/.env.*.local

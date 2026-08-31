@@ -1,8 +1,11 @@
-"""Order lookup tool (SQLite-backed; swap for real HTTP later)."""
+"""Order lookup tool (SQLAlchemy-backed; swap for real HTTP later)."""
 
 from __future__ import annotations
 
-from src.tools.business_db import get_connection, get_lock
+from sqlalchemy import select
+
+from mp_agent.dao.models import Order
+from src.tools.business_db import get_lock, get_session
 
 
 def lookup_order(order_id: str) -> dict[str, str] | None:
@@ -10,28 +13,22 @@ def lookup_order(order_id: str) -> dict[str, str] | None:
     if not oid:
         return None
     with get_lock():
-        row = get_connection().execute(
-            """
-            SELECT order_id, status, carrier, tracking_no, eta, last_event
-            FROM orders WHERE order_id = ?
-            """,
-            (oid,),
-        ).fetchone()
-    if row is None:
-        return None
-    return {
-        "order_id": str(row["order_id"]),
-        "status": str(row["status"]),
-        "carrier": str(row["carrier"]),
-        "tracking_no": str(row["tracking_no"]),
-        "eta": str(row["eta"]),
-        "last_event": str(row["last_event"]),
-    }
+        with get_session() as session:
+            order = session.scalar(select(Order).where(Order.order_id == oid))
+            if order is None:
+                return None
+            return {
+                "order_id": order.order_id,
+                "status": order.status,
+                "carrier": order.carrier,
+                "tracking_no": order.tracking_no,
+                "eta": order.eta,
+                "last_event": order.last_event,
+            }
 
 
 def list_order_ids() -> list[str]:
     with get_lock():
-        rows = get_connection().execute(
-            "SELECT order_id FROM orders ORDER BY order_id"
-        ).fetchall()
-    return [str(r["order_id"]) for r in rows]
+        with get_session() as session:
+            rows = session.execute(select(Order.order_id).order_by(Order.order_id))
+            return [r[0] for r in rows]

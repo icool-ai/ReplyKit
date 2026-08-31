@@ -1,14 +1,17 @@
-"""Session store: chat history + bot session snapshot, owned by username."""
+"""Session store: chat history + bot session snapshot, owned by username (SQLAlchemy)."""
 
 from __future__ import annotations
 
-import json
-import sqlite3
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from threading import Lock
 from typing import Any, Protocol
+
+from sqlalchemy import Engine, and_, func, select
+from sqlalchemy.orm import Session
+
+from mp_agent.dao._helpers import dt_to_unix, utc_now
+from mp_agent.dao.models import ChatSession
+from mp_agent.dao.sync_db import sync_engine
 
 
 @dataclass
@@ -92,23 +95,6 @@ def _preview_from_history(history: list[dict[str, str]]) -> str:
     return ""
 
 
-def _iso_to_unix(raw: object) -> int:
-    if isinstance(raw, (int, float)):
-        return int(raw)
-    s = str(raw or "").strip()
-    if not s:
-        return 0
-    if s.isdigit():
-        return int(s)
-    try:
-        from datetime import datetime
-
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return int(dt.timestamp())
-    except ValueError:
-        return 0
-
-
 class SessionStore(Protocol):
     def get(self, session_id: str) -> SessionData: ...
 
@@ -128,7 +114,7 @@ class SessionStore(Protocol):
 class InMemorySessionStore:
     def __init__(self) -> None:
         self._sessions: dict[str, SessionData] = {}
-        self._lock = Lock()
+        self._lock = __import__("threading").Lock()
 
     def get(self, session_id: str) -> SessionData:
         key = _normalize_session_id(session_id)
@@ -208,7 +194,6 @@ class InMemorySessionStore:
         data = self.get(session_id)
         if data.username != username:
             return None
-        # empty brand-new get creates empty session without username — treat missing row
         key = _normalize_session_id(session_id)
         with self._lock:
             if key not in self._sessions or self._sessions[key].username != username:
@@ -226,84 +211,32 @@ class InMemorySessionStore:
 
 
 class SqliteSessionStore:
-    """Persist sessions in a local SQLite file."""
+    """Persist sessions via SQLAlchemy ORM (drop-in replacement for old sqlite3 impl)."""
 
-    def __init__(self, db_path: Path) -> None:
-        self._db_path = Path(db_path)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = Lock()
-        self._conn = sqlite3.connect(
-            str(self._db_path),
-            check_same_thread=False,
-            isolation_level=None,
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._init_schema()
+    def __init__(self, engine: Engine | None = None) -> None:
+        self._engine = engine or sync_engine
 
-    def _init_schema(self) -> None:
-        with self._lock:
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sessions (
-                    session_id TEXT PRIMARY KEY,
-                    history_json TEXT NOT NULL DEFAULT '[]',
-                    bot_state_json TEXT NOT NULL DEFAULT '{}',
-                    username TEXT,
-                    title TEXT NOT NULL DEFAULT '',
-                    created_at INTEGER NOT NULL DEFAULT 0,
-                    updated_at INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-            cols = {
-                str(r[1])
-                for r in self._conn.execute("PRAGMA table_info(sessions)").fetchall()
-            }
-            if "username" not in cols:
-                self._conn.execute("ALTER TABLE sessions ADD COLUMN username TEXT")
-            if "title" not in cols:
-                self._conn.execute(
-                    "ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''"
-                )
-            if "created_at" not in cols:
-                self._conn.execute(
-                    "ALTER TABLE sessions ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0"
-                )
-            # migrate legacy TEXT updated_at → keep column; also store unix in created/updated
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_sessions_user_updated "
-                "ON sessions(username, updated_at DESC)"
-            )
-
-    def get(self, session_id: str) -> SessionData:
-        key = _normalize_session_id(session_id)
-        with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT history_json, bot_state_json, username, title,
-                       created_at, updated_at
-                FROM sessions WHERE session_id = ?
-                """,
-                (key,),
-            ).fetchone()
-        if row is None:
+    def _row_to_data(self, s: ChatSession | None) -> SessionData:
+        if s is None:
             return SessionData()
-        try:
-            history = _parse_history(json.loads(row["history_json"] or "[]"))
-        except json.JSONDecodeError:
-            history = []
-        try:
-            bot_state = _parse_bot_state(json.loads(row["bot_state_json"] or "{}"))
-        except json.JSONDecodeError:
-            bot_state = {}
+        history = _parse_history(s.history_json or [])
+        bot_state = _parse_bot_state(s.bot_state_json or {})
         return SessionData(
             history=history,
             bot_state=bot_state,
-            username=(str(row["username"]) if row["username"] else None),
-            title=str(row["title"] or ""),
-            created_at=_iso_to_unix(row["created_at"]),
-            updated_at=_iso_to_unix(row["updated_at"]),
+            username=s.username,
+            title=s.title or "",
+            created_at=dt_to_unix(s.created_at),
+            updated_at=dt_to_unix(s.updated_at),
         )
+
+    def get(self, session_id: str) -> SessionData:
+        key = _normalize_session_id(session_id)
+        with Session(self._engine) as db:
+            row = db.scalar(
+                select(ChatSession).where(ChatSession.session_id == key)
+            )
+            return self._row_to_data(row)
 
     def save(
         self,
@@ -315,69 +248,56 @@ class SqliteSessionStore:
         title: str | None = None,
     ) -> None:
         key = _normalize_session_id(session_id)
-        now = int(time.time())
-        history_json = json.dumps(list(history), ensure_ascii=False)
-        bot_state_json = json.dumps(dict(bot_state), ensure_ascii=False)
-        with self._lock:
-            prev = self._conn.execute(
-                "SELECT username, title, created_at FROM sessions WHERE session_id = ?",
-                (key,),
-            ).fetchone()
+        now_dt = utc_now()
+        now_unix = int(time.time())
+
+        with Session(self._engine) as db:
+            row = db.scalar(
+                select(ChatSession).where(ChatSession.session_id == key)
+            )
             owner = username
-            if owner is None and prev is not None and prev["username"]:
-                owner = str(prev["username"])
-            existing_title = str(prev["title"]) if prev is not None else ""
+            if owner is None and row is not None and row.username:
+                owner = row.username
+            existing_title = row.title if row is not None else ""
             resolved_title = _title_from_history(
                 history, title if title is not None else existing_title
             )
-            created = (
-                _iso_to_unix(prev["created_at"])
-                if prev is not None and prev["created_at"]
-                else now
+            created_at_dt = (
+                row.created_at
+                if row is not None and row.created_at and dt_to_unix(row.created_at) > 0
+                else now_dt
             )
-            self._conn.execute("BEGIN")
-            try:
-                self._conn.execute(
-                    """
-                    INSERT INTO sessions (
-                        session_id, history_json, bot_state_json,
-                        username, title, created_at, updated_at
+
+            if row is None:
+                db.add(
+                    ChatSession(
+                        session_id=key,
+                        username=owner,
+                        title=resolved_title,
+                        history_json=list(history),
+                        bot_state_json=dict(bot_state),
+                        created_at=created_at_dt,
+                        updated_at=now_dt,
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(session_id) DO UPDATE SET
-                        history_json = excluded.history_json,
-                        bot_state_json = excluded.bot_state_json,
-                        username = COALESCE(excluded.username, sessions.username),
-                        title = excluded.title,
-                        created_at = CASE
-                            WHEN sessions.created_at IS NULL OR sessions.created_at = 0
-                            THEN excluded.created_at
-                            ELSE sessions.created_at
-                        END,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        key,
-                        history_json,
-                        bot_state_json,
-                        owner,
-                        resolved_title,
-                        created,
-                        now,
-                    ),
                 )
-                self._conn.execute("COMMIT")
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
+            else:
+                row.username = owner
+                row.title = resolved_title
+                row.history_json = list(history)
+                row.bot_state_json = dict(bot_state)
+                row.created_at = created_at_dt
+                row.updated_at = now_dt
+            db.commit()
 
     def clear(self, session_id: str) -> None:
         key = _normalize_session_id(session_id)
-        with self._lock:
-            self._conn.execute(
-                "DELETE FROM sessions WHERE session_id = ?",
-                (key,),
+        with Session(self._engine) as db:
+            row = db.scalar(
+                select(ChatSession).where(ChatSession.session_id == key)
             )
+            if row is not None:
+                db.delete(row)
+                db.commit()
 
     def list_for_user(
         self, username: str, *, page: int = 1, page_size: int = 20
@@ -385,85 +305,65 @@ class SqliteSessionStore:
         page = max(1, int(page))
         page_size = max(1, min(int(page_size), 100))
         user = (username or "").strip()
-        with self._lock:
-            total = int(
-                self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM sessions WHERE username = ?",
-                    (user,),
-                ).fetchone()["n"]
-            )
-            offset = (page - 1) * page_size
-            rows = self._conn.execute(
-                """
-                SELECT session_id, title, history_json, created_at, updated_at
-                FROM sessions
-                WHERE username = ?
-                ORDER BY updated_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                (user, page_size, offset),
-            ).fetchall()
-        items: list[SessionSummary] = []
-        for row in rows:
-            try:
-                history = _parse_history(json.loads(row["history_json"] or "[]"))
-            except json.JSONDecodeError:
-                history = []
-            items.append(
-                SessionSummary(
-                    session_id=str(row["session_id"]),
-                    title=str(row["title"] or "") or "新会话",
-                    preview=_preview_from_history(history),
-                    updated_at=_iso_to_unix(row["updated_at"]),
-                    created_at=_iso_to_unix(row["created_at"]),
+
+        with Session(self._engine) as db:
+            total = db.scalar(
+                select(func.count()).select_from(ChatSession).where(
+                    ChatSession.username == user
                 )
+            ) or 0
+            offset = (page - 1) * page_size
+            rows = db.execute(
+                select(ChatSession)
+                .where(ChatSession.username == user)
+                .order_by(ChatSession.updated_at.desc())
+                .limit(page_size)
+                .offset(offset)
+            ).scalars().all()
+
+            items: list[SessionSummary] = []
+            for row in rows:
+                history = _parse_history(row.history_json or [])
+                items.append(
+                    SessionSummary(
+                        session_id=row.session_id,
+                        title=row.title or "新会话",
+                        preview=_preview_from_history(history),
+                        updated_at=dt_to_unix(row.updated_at),
+                        created_at=dt_to_unix(row.created_at),
+                    )
+                )
+            return SessionPage(
+                items=items, total=total, page=page, page_size=page_size
             )
-        return SessionPage(
-            items=items, total=total, page=page, page_size=page_size
-        )
 
     def get_for_user(self, session_id: str, username: str) -> SessionData | None:
         key = _normalize_session_id(session_id)
         user = (username or "").strip()
-        with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT history_json, bot_state_json, username, title,
-                       created_at, updated_at
-                FROM sessions
-                WHERE session_id = ? AND username = ?
-                """,
-                (key, user),
-            ).fetchone()
-        if row is None:
-            return None
-        try:
-            history = _parse_history(json.loads(row["history_json"] or "[]"))
-        except json.JSONDecodeError:
-            history = []
-        try:
-            bot_state = _parse_bot_state(json.loads(row["bot_state_json"] or "{}"))
-        except json.JSONDecodeError:
-            bot_state = {}
-        return SessionData(
-            history=history,
-            bot_state=bot_state,
-            username=str(row["username"]),
-            title=str(row["title"] or ""),
-            created_at=_iso_to_unix(row["created_at"]),
-            updated_at=_iso_to_unix(row["updated_at"]),
-        )
+        with Session(self._engine) as db:
+            row = db.scalar(
+                select(ChatSession).where(
+                    and_(ChatSession.session_id == key, ChatSession.username == user)
+                )
+            )
+            if row is None:
+                return None
+            return self._row_to_data(row)
 
     def delete_for_user(self, session_id: str, username: str) -> bool:
         key = _normalize_session_id(session_id)
         user = (username or "").strip()
-        with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM sessions WHERE session_id = ? AND username = ?",
-                (key, user),
+        with Session(self._engine) as db:
+            row = db.scalar(
+                select(ChatSession).where(
+                    and_(ChatSession.session_id == key, ChatSession.username == user)
+                )
             )
-            return (cur.rowcount or 0) > 0
+            if row is None:
+                return False
+            db.delete(row)
+            db.commit()
+            return True
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        return None

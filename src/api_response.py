@@ -5,15 +5,20 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Generic, TypeVar
 
+from fastapi.encoders import jsonable_encoder
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from src.http_observability import get_request_id
+
 T = TypeVar("T")
+logger = logging.getLogger("replykit.http")
 
 
 class ApiResponse(BaseModel, Generic[T]):
@@ -52,9 +57,16 @@ def fail(
 def register_exception_handlers(app: Any) -> None:
     """HTTP / validation / uncaught errors all use the same envelope."""
 
+    def _response_headers(
+        request: Request, extra_headers: dict[str, str] | None = None
+    ) -> dict[str, str]:
+        headers = dict(extra_headers or {})
+        headers.setdefault("X-Request-ID", get_request_id(request))
+        return headers
+
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(
-        _request: Request, exc: StarletteHTTPException
+        request: Request, exc: StarletteHTTPException
     ) -> JSONResponse:
         detail = exc.detail
         if isinstance(detail, (list, dict)):
@@ -67,26 +79,45 @@ def register_exception_handlers(app: Any) -> None:
         return JSONResponse(
             status_code=exc.status_code,
             content={"code": exc.status_code, "message": message, "data": data},
-            headers=headers,
+            headers=_response_headers(request, headers),
         )
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(
-        _request: Request, exc: RequestValidationError
+        request: Request, exc: RequestValidationError
     ) -> JSONResponse:
+        errors = jsonable_encoder(
+            exc.errors(),
+            custom_encoder={Exception: str, ValueError: str},
+        )
+        logger.warning(
+            "validation failed %s %s request_id=%s errors=%s",
+            request.method,
+            request.url.path,
+            get_request_id(request),
+            errors,
+        )
         return JSONResponse(
             status_code=422,
             content={
                 "code": 422,
                 "message": "参数校验失败",
-                "data": exc.errors(),
+                "data": errors,
             },
+            headers=_response_headers(request),
         )
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(
-        _request: Request, exc: Exception
+        request: Request, exc: Exception
     ) -> JSONResponse:
+        request_id = get_request_id(request)
+        logger.exception(
+            "unhandled error %s %s request_id=%s",
+            request.method,
+            request.url.path,
+            request_id,
+        )
         # Avoid leaking stack traces in the message; keep a short detail in data.
         return JSONResponse(
             status_code=500,
@@ -95,4 +126,5 @@ def register_exception_handlers(app: Any) -> None:
                 "message": "服务器内部错误",
                 "data": {"detail": f"{type(exc).__name__}: {exc}"},
             },
+            headers=_response_headers(request),
         )

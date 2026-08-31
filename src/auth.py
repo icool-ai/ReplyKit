@@ -1,19 +1,41 @@
-"""JWT auth with user/ops roles, registration, and user management."""
+"""JWT auth with user/ops roles, registration, and user management (SQLAlchemy).
+
+Now with OPTIONAL Redis-backed features:
+1. JWT access-token blacklist (single-jti + user-wide revoke-before markers)
+   so logout / password-change / disable-user can *instantly* invalidate
+   still-valid access tokens.
+2. Login rate limiting (fixed-window counter per IP + username pair) to
+   prevent brute-force attacks.
+
+Both features gracefully degrade to no-ops when the `redis` package is
+not installed or ``REDIS_URL`` is not configured — core auth never breaks.
+"""
 
 from __future__ import annotations
 
 import re
 import secrets
-import sqlite3
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from threading import Lock
 from typing import Any, Literal
 
 import bcrypt
 import jwt
 from fastapi import HTTPException
+from sqlalchemy import Engine, and_, func, or_, select
+from sqlalchemy.orm import Session
+
+from mp_agent.dao._helpers import dt_to_unix, unix_to_dt, utc_now
+from mp_agent.dao.models import RefreshToken, User
+from mp_agent.dao.redis_client import (
+    RateLimitExceeded,
+    get_user_revoke_before,
+    is_access_blacklisted,
+    login_rate_limit_increment,
+    login_rate_limit_reset,
+    revoke_all_access_for_user,
+)
+from mp_agent.dao.sync_db import sync_engine
 
 Role = Literal["user", "ops"]
 ROLES = frozenset({"user", "ops"})
@@ -29,6 +51,7 @@ class TokenPair:
     refresh_expires_in: int
     username: str
     role: Role
+    access_jti: str = ""
 
 
 @dataclass(frozen=True)
@@ -62,18 +85,25 @@ class UserPage:
 
 
 class AuthService:
-    """SQLite users (role) + JWT access + opaque refresh tokens."""
+    """Users + JWT access + opaque refresh tokens (SQLAlchemy).
+
+    Optional Redis features (zero-config fallback):
+    * Access-token revocation via per-jti blacklist / user-wide marker.
+    * Login brute-force rate limiting.
+    """
 
     def __init__(
         self,
         *,
-        db_path: Path,
+        engine: Engine | None = None,
         jwt_secret: str,
         access_ttl: int,
         refresh_ttl: int,
         admin_username: str,
         admin_password: str,
         allow_register: bool = True,
+        login_rate_limit: int = 5,
+        login_rate_window_sec: int = 300,
     ) -> None:
         if not jwt_secret or len(jwt_secret) < 32:
             raise ValueError("JWT_SECRET 未配置或过短（至少 32 字符）")
@@ -82,197 +112,203 @@ class AuthService:
         if not _USERNAME_RE.match(admin_username):
             raise ValueError("ADMIN_USERNAME 须为 3–32 位字母、数字或下划线")
 
-        self._db_path = db_path
+        self._engine = engine or sync_engine
         self._jwt_secret = jwt_secret
         self._access_ttl = max(60, access_ttl)
         self._refresh_ttl = max(60, refresh_ttl)
         self._allow_register = allow_register
         self._admin_username = admin_username
-        self._lock = Lock()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+        self._login_rate_limit = max(1, int(login_rate_limit))
+        self._login_rate_window_sec = max(10, int(login_rate_window_sec))
         self._ensure_admin(admin_username, admin_password)
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _init_db(self) -> None:
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS users (
-                        username TEXT PRIMARY KEY,
-                        password_hash TEXT NOT NULL,
-                        role TEXT NOT NULL DEFAULT 'user',
-                        enabled INTEGER NOT NULL DEFAULT 1,
-                        created_at INTEGER NOT NULL
-                    )
-                    """
-                )
-                cols = {
-                    str(r[1])
-                    for r in conn.execute("PRAGMA table_info(users)").fetchall()
-                }
-                if "role" not in cols:
-                    conn.execute(
-                        "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'"
-                    )
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS refresh_tokens (
-                        token TEXT PRIMARY KEY,
-                        username TEXT NOT NULL,
-                        expires_at INTEGER NOT NULL,
-                        created_at INTEGER NOT NULL
-                    )
-                    """
-                )
-                conn.commit()
-            finally:
-                conn.close()
-
+    # ------------------------------------------------------------------
+    # Bootstrap
+    # ------------------------------------------------------------------
     def _ensure_admin(self, username: str, password: str) -> None:
-        now = int(time.time())
         password_hash = self._hash_password(password)
-        with self._lock:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    "SELECT username, role FROM users WHERE username = ?",
-                    (username,),
-                ).fetchone()
-                if row is None:
-                    conn.execute(
-                        """
-                        INSERT INTO users
-                            (username, password_hash, role, enabled, created_at)
-                        VALUES (?, ?, 'ops', 1, ?)
-                        """,
-                        (username, password_hash, now),
+        with Session(self._engine) as session:
+            user = session.get(User, username)
+            if user is None:
+                session.add(
+                    User(
+                        username=username,
+                        password_hash=password_hash,
+                        role="ops",
+                        enabled=True,
+                        created_at=utc_now(),
                     )
-                else:
-                    # 种子账号保持运营身份（不改密码，避免覆盖已改密）
-                    conn.execute(
-                        "UPDATE users SET role = 'ops', enabled = 1 WHERE username = ?",
-                        (username,),
-                    )
-                conn.commit()
-            finally:
-                conn.close()
+                )
+            else:
+                user.role = "ops"
+                user.enabled = True
+            session.commit()
 
+    # ------------------------------------------------------------------
+    # Login rate limiting (场景 5)
+    # ------------------------------------------------------------------
+    def check_login_rate_limit(self, *, client_ip: str, username: str) -> None:
+        """Raise HTTP 429 if IP+user has exceeded the login attempt window.
+
+        Always safe: no Redis == no-op (never raises).
+        """
+        try:
+            login_rate_limit_increment(
+                ip=client_ip or "unknown",
+                username=(username or "").strip() or "*",
+                limit=self._login_rate_limit,
+                window_seconds=self._login_rate_window_sec,
+            )
+        except RateLimitExceeded as exc:
+            headers = {"Retry-After": str(exc.retry_after_seconds)}
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "message": f"尝试过于频繁，请 {exc.retry_after_seconds} 秒后重试",
+                    "retry_after": exc.retry_after_seconds,
+                    "attempts": exc.attempts,
+                    "limit": exc.limit,
+                    "window_seconds": exc.window_seconds,
+                },
+                headers=headers,
+            ) from exc
+
+    def reset_login_rate_limit(self, *, client_ip: str, username: str) -> None:
+        """Clear the rate-limit counter after a successful login."""
+        login_rate_limit_reset(
+            ip=client_ip or "unknown",
+            username=(username or "").strip() or "*",
+        )
+
+    # ------------------------------------------------------------------
+    # Registration / login / token issuance
+    # ------------------------------------------------------------------
     def register(self, username: str, password: str) -> TokenPair:
         if not self._allow_register:
             raise HTTPException(status_code=403, detail="当前不允许注册")
         user = self._validate_username(username)
         self._validate_password(password)
-        now = int(time.time())
         password_hash = self._hash_password(password)
-        with self._lock:
-            conn = self._connect()
-            try:
-                existing = conn.execute(
-                    "SELECT username FROM users WHERE username = ?",
-                    (user,),
-                ).fetchone()
-                if existing is not None:
-                    raise HTTPException(status_code=409, detail="用户名已存在")
-                try:
-                    conn.execute(
-                        """
-                        INSERT INTO users
-                            (username, password_hash, role, enabled, created_at)
-                        VALUES (?, ?, 'user', 1, ?)
-                        """,
-                        (user, password_hash, now),
-                    )
-                    conn.commit()
-                except sqlite3.IntegrityError as exc:
-                    raise HTTPException(
-                        status_code=409, detail="用户名已存在"
-                    ) from exc
-            finally:
-                conn.close()
+
+        with Session(self._engine) as session:
+            if session.get(User, user) is not None:
+                raise HTTPException(status_code=409, detail="用户名已存在")
+            session.add(
+                User(
+                    username=user,
+                    password_hash=password_hash,
+                    role="user",
+                    enabled=True,
+                    created_at=utc_now(),
+                )
+            )
+            session.commit()
         return self._issue_pair(user, "user")
 
-    def login(self, username: str, password: str) -> TokenPair:
+    def login(
+        self,
+        username: str,
+        password: str,
+        *,
+        client_ip: str = "",
+    ) -> TokenPair:
+        """Verify credentials and issue tokens.
+
+        Also enforces login-rate limiting:
+        * Every call (success or failure) bumps the attempt counter.
+        * On success the counter is cleared so the next session starts clean.
+        """
         user = (username or "").strip()
-        with self._lock:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    """
-                    SELECT password_hash, enabled, role
-                    FROM users WHERE username = ?
-                    """,
-                    (user,),
-                ).fetchone()
-            finally:
-                conn.close()
-        if row is None or not int(row["enabled"]):
-            raise HTTPException(status_code=401, detail="用户名或密码错误")
-        if not self._verify_password(password, str(row["password_hash"])):
-            raise HTTPException(status_code=401, detail="用户名或密码错误")
-        role = self._normalize_role(row["role"])
-        return self._issue_pair(user, role)
+        self.check_login_rate_limit(client_ip=client_ip, username=user)
+        try:
+            with Session(self._engine) as session:
+                db_user = session.get(User, user)
+                if db_user is None or not db_user.enabled:
+                    raise HTTPException(status_code=401, detail="用户名或密码错误")
+                if not self._verify_password(password, db_user.password_hash):
+                    raise HTTPException(status_code=401, detail="用户名或密码错误")
+                role = self._normalize_role(db_user.role)
+        except HTTPException:
+            raise
+        pair = self._issue_pair(user, role)
+        self.reset_login_rate_limit(client_ip=client_ip, username=user)
+        return pair
 
     def refresh(self, refresh_token: str) -> TokenPair:
         token = (refresh_token or "").strip()
         if not token:
             raise HTTPException(status_code=401, detail="refresh_token 无效或已过期")
-        now = int(time.time())
-        with self._lock:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    "SELECT username, expires_at FROM refresh_tokens WHERE token = ?",
-                    (token,),
-                ).fetchone()
-                if row is None or int(row["expires_at"]) < now:
-                    if row is not None:
-                        conn.execute(
-                            "DELETE FROM refresh_tokens WHERE token = ?", (token,)
-                        )
-                        conn.commit()
-                    raise HTTPException(
-                        status_code=401, detail="refresh_token 无效或已过期"
-                    )
-                username = str(row["username"])
-                user_row = conn.execute(
-                    "SELECT enabled, role FROM users WHERE username = ?",
-                    (username,),
-                ).fetchone()
-                if user_row is None or not int(user_row["enabled"]):
-                    conn.execute(
-                        "DELETE FROM refresh_tokens WHERE token = ?", (token,)
-                    )
-                    conn.commit()
-                    raise HTTPException(
-                        status_code=401, detail="refresh_token 无效或已过期"
-                    )
-                role = self._normalize_role(user_row["role"])
-                conn.execute("DELETE FROM refresh_tokens WHERE token = ?", (token,))
-                conn.commit()
-            finally:
-                conn.close()
-        return self._issue_pair(username, role)
 
-    def logout(self, refresh_token: str) -> bool:
+        with Session(self._engine) as session:
+            rt = session.scalar(
+                select(RefreshToken).where(RefreshToken.token == token)
+            )
+            now = utc_now()
+            if rt is None or rt.expires_at < now:
+                if rt is not None:
+                    session.delete(rt)
+                    session.commit()
+                raise HTTPException(
+                    status_code=401, detail="refresh_token 无效或已过期"
+                )
+
+            db_user = session.get(User, rt.username)
+            if db_user is None or not db_user.enabled:
+                session.delete(rt)
+                session.commit()
+                raise HTTPException(
+                    status_code=401, detail="refresh_token 无效或已过期"
+                )
+            role = self._normalize_role(db_user.role)
+            session.delete(rt)
+            session.commit()
+        return self._issue_pair(rt.username, role)
+
+    # ------------------------------------------------------------------
+    # Logout + access token revocation (场景 1)
+    # ------------------------------------------------------------------
+    def logout(
+        self,
+        refresh_token: str,
+        *,
+        access_jti: str | None = None,
+        access_remaining_ttl: int | None = None,
+        username: str | None = None,
+    ) -> bool:
+        """Invalidate a refresh token (DB) and optionally the access token (Redis).
+
+        Three revocation modes, strongest-first:
+        1. ``username`` provided    → revoke *all* access tokens for the user
+           (via "revoke_all before now" marker).  Most idiomatic: a user
+           clicking "logout" usually means "kick all my sessions".
+        2. ``access_jti`` + ttl     → blacklist a single JTI.
+        3. Neither (Redis down)     → only delete the refresh token from DB;
+           existing access tokens stay valid until their natural expiry
+           (original behaviour, safe fallback).
+        """
         token = (refresh_token or "").strip()
-        if not token:
-            return True
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute("DELETE FROM refresh_tokens WHERE token = ?", (token,))
-                conn.commit()
-            finally:
-                conn.close()
+        if token:
+            with Session(self._engine) as session:
+                rt = session.scalar(
+                    select(RefreshToken).where(RefreshToken.token == token)
+                )
+                if rt is not None:
+                    resolved_user = username or rt.username
+                    session.delete(rt)
+                    session.commit()
+                    revoke_all_access_for_user(resolved_user, ttl_seconds=self._access_ttl)
+                    return True
+        # Fallback: refresh token was empty / not found, still try user-wide revoke
+        if username:
+            revoke_all_access_for_user(username, ttl_seconds=self._access_ttl)
+        if access_jti and access_remaining_ttl:
+            from mp_agent.dao.redis_client import blacklist_access_jti
+            blacklist_access_jti(access_jti, ttl_seconds=access_remaining_ttl)
         return True
 
+    # ------------------------------------------------------------------
+    # Access-token decoding + blacklist check (场景 1)
+    # ------------------------------------------------------------------
     def decode_access(self, token: str) -> dict[str, Any]:
         try:
             payload = jwt.decode(
@@ -300,9 +336,29 @@ class AuthService:
                 status_code=401,
                 detail="未授权：请提供有效的 Bearer Token",
             )
+        # ---------- Redis 黑名单检查 ----------
+        # (a) 单 JTI 精确拉黑
+        jti = str(payload.get("jti") or "").strip()
+        if jti and is_access_blacklisted(jti):
+            raise HTTPException(
+                status_code=401,
+                detail="access_token 已被吊销",
+            )
+        # (b) 用户级 "iat < revoke_before" 粗粒度拉黑
+        revoke_before = get_user_revoke_before(sub)
+        if revoke_before:
+            iat = int(payload.get("iat") or 0)
+            if iat and iat < revoke_before:
+                raise HTTPException(
+                    status_code=401,
+                    detail="access_token 已被吊销（用户级吊销）",
+                )
         role = self._normalize_role(payload.get("role"))
         return {"sub": sub, "role": role, **payload}
 
+    # ------------------------------------------------------------------
+    # User CRUD (ops)
+    # ------------------------------------------------------------------
     def create_user(
         self,
         *,
@@ -311,47 +367,28 @@ class AuthService:
         password: str,
         role: Role = "user",
     ) -> UserRow:
-        """Ops creates a user (may set role=ops)."""
+        _ = actor
         user = self._validate_username(username)
         self._validate_password(password)
         role = self._normalize_role(role)
-        now = int(time.time())
         password_hash = self._hash_password(password)
-        with self._lock:
-            conn = self._connect()
-            try:
-                existing = conn.execute(
-                    "SELECT username FROM users WHERE username = ?",
-                    (user,),
-                ).fetchone()
-                if existing is not None:
-                    raise HTTPException(status_code=409, detail="用户名已存在")
-                try:
-                    conn.execute(
-                        """
-                        INSERT INTO users
-                            (username, password_hash, role, enabled, created_at)
-                        VALUES (?, ?, ?, 1, ?)
-                        """,
-                        (user, password_hash, role, now),
-                    )
-                    conn.commit()
-                except sqlite3.IntegrityError as exc:
-                    raise HTTPException(
-                        status_code=409, detail="用户名已存在"
-                    ) from exc
-                row = conn.execute(
-                    """
-                    SELECT username, role, enabled, created_at
-                    FROM users WHERE username = ?
-                    """,
-                    (user,),
-                ).fetchone()
-            finally:
-                conn.close()
-        assert row is not None
-        _ = actor
-        return self._row_to_user(row)
+
+        with Session(self._engine) as session:
+            if session.get(User, user) is not None:
+                raise HTTPException(status_code=409, detail="用户名已存在")
+            session.add(
+                User(
+                    username=user,
+                    password_hash=password_hash,
+                    role=role,
+                    enabled=True,
+                    created_at=utc_now(),
+                )
+            )
+            session.commit()
+            created = session.get(User, user)
+            assert created is not None
+            return _user_to_row(created)
 
     def list_users(
         self,
@@ -364,47 +401,35 @@ class AuthService:
     ) -> UserPage:
         page = max(1, int(page))
         page_size = max(1, min(int(page_size), 200))
-        where: list[str] = []
-        params: list[Any] = []
-        kw = (keyword or "").strip()
-        if kw:
-            where.append("username LIKE ?")
-            params.append(f"%{kw}%")
-        if role:
-            where.append("role = ?")
-            params.append(self._normalize_role(role))
-        if enabled is not None:
-            where.append("enabled = ?")
-            params.append(1 if enabled else 0)
-        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
-        with self._lock:
-            conn = self._connect()
-            try:
-                total = int(
-                    conn.execute(
-                        f"SELECT COUNT(*) AS n FROM users {where_sql}",
-                        params,
-                    ).fetchone()["n"]
-                )
-                offset = (page - 1) * page_size
-                rows = conn.execute(
-                    f"""
-                    SELECT username, role, enabled, created_at
-                    FROM users
-                    {where_sql}
-                    ORDER BY created_at DESC, username ASC
-                    LIMIT ? OFFSET ?
-                    """,
-                    [*params, page_size, offset],
-                ).fetchall()
-            finally:
-                conn.close()
-        return UserPage(
-            items=[self._row_to_user(r) for r in rows],
-            total=total,
-            page=page,
-            page_size=page_size,
-        )
+
+        with Session(self._engine) as session:
+            filters: list[Any] = []
+            kw = (keyword or "").strip()
+            if kw:
+                filters.append(User.username.ilike(f"%{kw}%"))
+            if role:
+                filters.append(User.role == self._normalize_role(role))
+            if enabled is not None:
+                filters.append(User.enabled.is_(bool(enabled)))
+
+            count_stmt = select(func.count()).select_from(User)
+            stmt = select(User)
+            if filters:
+                for f in filters:
+                    count_stmt = count_stmt.where(f)
+                    stmt = stmt.where(f)
+
+            total = session.scalar(count_stmt) or 0
+            offset = (page - 1) * page_size
+            stmt = stmt.order_by(User.created_at.desc(), User.username.asc())
+            stmt = stmt.limit(page_size).offset(offset)
+            rows = session.execute(stmt).scalars().all()
+            return UserPage(
+                items=[_user_to_row(r) for r in rows],
+                total=total,
+                page=page,
+                page_size=page_size,
+            )
 
     def update_user(
         self,
@@ -425,129 +450,97 @@ class AuthService:
         if role is not None:
             role = self._normalize_role(role)
 
-        with self._lock:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    """
-                    SELECT username, role, enabled, created_at, password_hash
-                    FROM users WHERE username = ?
-                    """,
-                    (user,),
-                ).fetchone()
-                if row is None:
-                    raise HTTPException(status_code=404, detail="用户不存在")
+        with Session(self._engine) as session:
+            db_user = session.get(User, user)
+            if db_user is None:
+                raise HTTPException(status_code=404, detail="用户不存在")
 
-                new_role = self._normalize_role(role if role is not None else row["role"])
-                new_enabled = (
-                    bool(enabled) if enabled is not None else bool(int(row["enabled"]))
-                )
-                new_hash = (
-                    self._hash_password(password)
-                    if password is not None
-                    else str(row["password_hash"])
-                )
+            old_role = self._normalize_role(db_user.role)
+            new_role = self._normalize_role(role if role is not None else db_user.role)
+            new_enabled = bool(enabled) if enabled is not None else db_user.enabled
+            new_hash = (
+                self._hash_password(password)
+                if password is not None
+                else db_user.password_hash
+            )
 
-                # 不可禁用/降级自己；不可去掉最后一个 ops
-                if user == actor and (not new_enabled or new_role != "ops"):
-                    if not new_enabled:
-                        raise HTTPException(
-                            status_code=422, detail="不能禁用当前登录账号"
-                        )
-                    if new_role != "ops" and self._normalize_role(row["role"]) == "ops":
-                        raise HTTPException(
-                            status_code=422, detail="不能取消自己的运营身份"
-                        )
-
-                if (
-                    self._normalize_role(row["role"]) == "ops"
-                    and (new_role != "ops" or not new_enabled)
-                ):
-                    ops_count = int(
-                        conn.execute(
-                            "SELECT COUNT(*) AS n FROM users "
-                            "WHERE role = 'ops' AND enabled = 1"
-                        ).fetchone()["n"]
+            if user == actor and (not new_enabled or new_role != "ops"):
+                if not new_enabled:
+                    raise HTTPException(
+                        status_code=422, detail="不能禁用当前登录账号"
                     )
-                    if ops_count <= 1:
-                        raise HTTPException(
-                            status_code=422,
-                            detail="不能移除最后一个运营账号",
-                        )
-
-                conn.execute(
-                    """
-                    UPDATE users
-                    SET role = ?, enabled = ?, password_hash = ?
-                    WHERE username = ?
-                    """,
-                    (new_role, 1 if new_enabled else 0, new_hash, user),
-                )
-                if not new_enabled or password is not None:
-                    conn.execute(
-                        "DELETE FROM refresh_tokens WHERE username = ?", (user,)
+                if new_role != "ops" and old_role == "ops":
+                    raise HTTPException(
+                        status_code=422, detail="不能取消自己的运营身份"
                     )
-                conn.commit()
-                updated = conn.execute(
-                    """
-                    SELECT username, role, enabled, created_at
-                    FROM users WHERE username = ?
-                    """,
-                    (user,),
-                ).fetchone()
-            finally:
-                conn.close()
-        assert updated is not None
-        return self._row_to_user(updated)
+
+            if old_role == "ops" and (new_role != "ops" or not new_enabled):
+                ops_count = session.scalar(
+                    select(func.count())
+                    .select_from(User)
+                    .where(and_(User.role == "ops", User.enabled.is_(True)))
+                ) or 0
+                if ops_count <= 1:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="不能移除最后一个运营账号",
+                    )
+
+            db_user.role = new_role
+            db_user.enabled = new_enabled
+            db_user.password_hash = new_hash
+
+            need_revoke = False
+            if not new_enabled or password is not None:
+                need_revoke = True
+                rts = session.execute(
+                    select(RefreshToken).where(RefreshToken.username == user)
+                ).scalars().all()
+                for rt in rts:
+                    session.delete(rt)
+
+            session.commit()
+
+            # 改密 / 禁用 → 立刻拉黑该用户所有现存 access token
+            if need_revoke:
+                revoke_all_access_for_user(user, ttl_seconds=self._access_ttl)
+
+            updated = session.get(User, user)
+            assert updated is not None
+            return _user_to_row(updated)
 
     def reset_password(self, *, actor: str, username: str, new_password: str) -> UserRow:
-        """Ops resets a user's password (forgot-password assistance)."""
-        _ = actor  # reserved for audit; auth already enforced at API layer
+        _ = actor
         user = (username or "").strip()
         if not user:
             raise HTTPException(status_code=422, detail="username 不能为空")
         self._validate_password(new_password)
         new_hash = self._hash_password(new_password)
-        with self._lock:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    """
-                    SELECT username, role, enabled, created_at
-                    FROM users WHERE username = ?
-                    """,
-                    (user,),
-                ).fetchone()
-                if row is None:
-                    raise HTTPException(status_code=404, detail="用户不存在")
-                conn.execute(
-                    "UPDATE users SET password_hash = ? WHERE username = ?",
-                    (new_hash, user),
-                )
-                conn.execute(
-                    "DELETE FROM refresh_tokens WHERE username = ?",
-                    (user,),
-                )
-                conn.commit()
-                return self._row_to_user(row)
-            finally:
-                conn.close()
 
+        with Session(self._engine) as session:
+            db_user = session.get(User, user)
+            if db_user is None:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            db_user.password_hash = new_hash
+            rts = session.execute(
+                select(RefreshToken).where(RefreshToken.username == user)
+            ).scalars().all()
+            for rt in rts:
+                session.delete(rt)
+            session.commit()
+        # 重置密码 → 用户级 access 全拉黑
+        revoke_all_access_for_user(user, ttl_seconds=self._access_ttl)
+        return _user_to_row(db_user)
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
     @staticmethod
     def _normalize_role(role: Any) -> Role:
         value = str(role or "user").strip().lower()
         if value not in ROLES:
             return "user"
         return value  # type: ignore[return-value]
-
-    @staticmethod
-    def _row_to_user(row: sqlite3.Row) -> UserRow:
-        return UserRow(
-            username=str(row["username"]),
-            role=AuthService._normalize_role(row["role"]),
-            enabled=bool(int(row["enabled"])),
-            created_at=int(row["created_at"]),
-        )
 
     @staticmethod
     def _validate_username(username: str) -> str:
@@ -582,32 +575,34 @@ class AuthService:
             return False
 
     def _issue_pair(self, username: str, role: Role) -> TokenPair:
-        now = int(time.time())
+        now_unix = int(time.time())
+        now_dt = unix_to_dt(now_unix)
+        # 每个 access token 带唯一 JTI，支持精确拉黑
+        access_jti = secrets.token_urlsafe(24)
         access = jwt.encode(
             {
                 "sub": username,
                 "role": role,
                 "typ": "access",
-                "iat": now,
-                "exp": now + self._access_ttl,
+                "jti": access_jti,
+                "iat": now_unix,
+                "exp": now_unix + self._access_ttl,
             },
             self._jwt_secret,
             algorithm="HS256",
         )
         refresh = secrets.token_urlsafe(48)
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO refresh_tokens (token, username, expires_at, created_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (refresh, username, now + self._refresh_ttl, now),
+        expires_at = unix_to_dt(now_unix + self._refresh_ttl)
+        with Session(self._engine) as session:
+            session.add(
+                RefreshToken(
+                    token=refresh,
+                    username=username,
+                    expires_at=expires_at,
+                    created_at=now_dt,
                 )
-                conn.commit()
-            finally:
-                conn.close()
+            )
+            session.commit()
         return TokenPair(
             access_token=access,
             token_type="Bearer",
@@ -616,4 +611,14 @@ class AuthService:
             refresh_expires_in=self._refresh_ttl,
             username=username,
             role=role,
+            access_jti=access_jti,
         )
+
+
+def _user_to_row(db_user: User) -> UserRow:
+    return UserRow(
+        username=db_user.username,
+        role=AuthService._normalize_role(db_user.role),
+        enabled=bool(db_user.enabled),
+        created_at=dt_to_unix(db_user.created_at),
+    )

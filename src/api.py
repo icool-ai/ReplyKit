@@ -40,6 +40,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
 from src.api_response import ApiResponse, ok, register_exception_handlers
+from src.agent_store import AgentStore
+from src.agents.competitor_routes import register_competitor_routes
 from src.asset_urls import paths_to_asset_urls
 from src.auth import AuthService
 from src.bot_config import (
@@ -99,6 +101,10 @@ from src.faq_store import (
     load_faq_entries_from_path,
     load_faq_entries_from_url,
     resolve_import_path,
+)
+from src.http_observability import (
+    configure_logging,
+    register_request_logging_middleware,
 )
 from src.knowledge import (
     delete_faq_vectors,
@@ -262,6 +268,47 @@ class UserResetPasswordRequest(BaseModel):
 class SessionClearData(BaseModel):
     status: str = "cleared"
     session_id: str
+
+
+class AgentItem(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    icon: str = ""
+    category: str = ""
+    runtime: str
+    enabled: bool = True
+    sort_order: int = 100
+    updated_at: int = 0
+
+
+class AgentListData(BaseModel):
+    items: list[AgentItem]
+
+
+class AgentUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    icon: str | None = None
+    category: str | None = None
+    enabled: bool | None = None
+    sort_order: int | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one(self) -> AgentUpdateRequest:
+        if all(
+            v is None
+            for v in (
+                self.name,
+                self.description,
+                self.icon,
+                self.category,
+                self.enabled,
+                self.sort_order,
+            )
+        ):
+            raise ValueError("至少需要更新一个字段")
+        return self
 
 
 class FaqItem(BaseModel):
@@ -572,19 +619,28 @@ def _token_data(pair: Any) -> dict[str, Any]:
 def create_api_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     bot = CustomerServiceBot(settings)
-    store = SqliteSessionStore(settings.session_db_path)
-    chat_logs = ChatLogStore(settings.chat_log_db_path)
-    faq_store = FaqStore(settings.faq_db_path)
-    sensitive_store = get_sensitive_store(settings.sensitive_db_path)
-    channel_store = get_channel_store(settings.channels_db_path)
+
+    from mp_agent.dao.sync_db import init_sync_db
+    from src.tools import business_db as business_db_module
+
+    init_sync_db()
+    business_db_module.configure_business_db()
+
+    store = SqliteSessionStore()
+    chat_logs = ChatLogStore()
+    faq_store = FaqStore()
+    sensitive_store = get_sensitive_store()
+    channel_store = get_channel_store()
+    agent_store = AgentStore()
     auth = AuthService(
-        db_path=settings.auth_db_path,
         jwt_secret=settings.jwt_secret,
         access_ttl=settings.jwt_access_ttl,
         refresh_ttl=settings.jwt_refresh_ttl,
         admin_username=settings.admin_username,
         admin_password=settings.admin_password,
         allow_register=settings.auth_allow_register,
+        login_rate_limit=settings.login_rate_limit,
+        login_rate_window_sec=settings.login_rate_window_sec,
     )
     bot_lock = threading.Lock()
     faq_lock = threading.Lock()
@@ -600,9 +656,24 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
     def _feishu_public(row: Any) -> dict[str, Any]:
         return FeishuChannelData(**row.to_public_dict()).model_dump()
 
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            from mp_agent.dao.db import init_db
+
+            await init_db()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "competitor SQLite init failed; ecommerce agent may be unavailable"
+            )
+        yield
+
     app = FastAPI(
         title="ReplyKit API",
         version="0.1.0",
+        lifespan=lifespan,
         description=(
             "统一响应：JSON 接口均为 {code, message, data}；"
             "code 与 HTTP 状态一致（200 成功，4xx/500 失败）。"
@@ -611,8 +682,10 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             "公开：/health、企微/飞书回调、飞书 OAuth 回调、"
             "/auth/login、/auth/register、/auth/refresh；"
             "POST /retrieval（Dify 外部知识库，Bearer=平台配置的 API Key，原生 JSON）。"
-            "普通用户：/chat、/sessions*、GET /bot-scripts、/channels/feishu*；"
+            "普通用户：/chat、/sessions*、GET /bot-scripts、/channels/feishu*、"
+            "GET /agents*、/agents/ecommerce-competitor*；"
             "运营 ops：/faqs*、/sensitive-words*、POST /bot-scripts*、/users*、"
+            "POST /agents/list、POST /agents/{id}/update、"
             "GET/POST /integrations/dify/keys*。"
             "POST /chat；GET /sessions；"
             "POST /faqs、/faqs/list…；POST /users、/users/list、/users/update、/users/reset-password；"
@@ -633,6 +706,7 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    register_request_logging_middleware(app)
     register_exception_handlers(app)
 
     def require_auth(
@@ -654,9 +728,62 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=403, detail="需要运营权限")
         return user
 
+    register_competitor_routes(app, require_auth=require_auth)
+
+    @app.get("/agents", response_model=ApiResponse[AgentListData])
+    def list_enabled_agents(
+        _: dict[str, Any] = Depends(require_auth),
+    ) -> dict[str, Any]:
+        items = [AgentItem(**a.to_dict()) for a in agent_store.list_agents(enabled_only=True)]
+        return ok(AgentListData(items=items).model_dump())
+
+    @app.get("/agents/{agent_id}", response_model=ApiResponse[AgentItem])
+    def get_agent(
+        agent_id: str,
+        _: dict[str, Any] = Depends(require_auth),
+    ) -> dict[str, Any]:
+        row = agent_store.get(agent_id)
+        if row is None or not row.enabled:
+            raise HTTPException(status_code=404, detail="Agent 不存在或未启用")
+        return ok(AgentItem(**row.to_dict()).model_dump())
+
+    @app.post("/agents/list", response_model=ApiResponse[AgentListData])
+    def list_all_agents(
+        _: dict[str, Any] = Depends(require_ops),
+    ) -> dict[str, Any]:
+        items = [AgentItem(**a.to_dict()) for a in agent_store.list_agents(enabled_only=False)]
+        return ok(AgentListData(items=items).model_dump())
+
+    @app.post("/agents/{agent_id}/update", response_model=ApiResponse[AgentItem])
+    def update_agent(
+        agent_id: str,
+        req: AgentUpdateRequest,
+        _: dict[str, Any] = Depends(require_ops),
+    ) -> dict[str, Any]:
+        row = agent_store.update(
+            agent_id,
+            name=req.name,
+            description=req.description,
+            icon=req.icon,
+            category=req.category,
+            enabled=req.enabled,
+            sort_order=req.sort_order,
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Agent 不存在")
+        return ok(AgentItem(**row.to_dict()).model_dump())
+
     @app.post("/auth/login", response_model=ApiResponse[TokenData])
-    def auth_login(req: LoginRequest) -> dict[str, Any]:
-        pair = auth.login(req.username, req.password)
+    def auth_login(req: LoginRequest, request: Request) -> dict[str, Any]:
+        client_ip = ""
+        try:
+            client_ip = request.client.host if request.client else ""
+        except Exception:
+            client_ip = ""
+        xff = request.headers.get("X-Forwarded-For") or request.headers.get("X-Real-IP")
+        if xff:
+            client_ip = xff.split(",")[0].strip() or client_ip
+        pair = auth.login(req.username, req.password, client_ip=client_ip)
         return ok(_token_data(pair))
 
     @app.post("/auth/register", response_model=ApiResponse[TokenData])
@@ -672,9 +799,13 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/auth/logout", response_model=ApiResponse[bool])
     def auth_logout(
         req: LogoutRequest,
-        _: dict[str, Any] = Depends(require_auth),
+        current_user: dict[str, Any] = Depends(require_auth),
     ) -> dict[str, Any]:
-        return ok(auth.logout(req.refresh_token), message="已退出")
+        username = str(current_user.get("sub") or "").strip() or None
+        return ok(
+            auth.logout(req.refresh_token, username=username),
+            message="已退出",
+        )
 
     @app.post("/users/list", response_model=ApiResponse[UserListData])
     def users_list(
@@ -2210,6 +2341,7 @@ app = create_api_app()
 def main() -> None:
     import uvicorn
 
+    configure_logging()
     host = os.getenv("API_HOST", "127.0.0.1")
     port = int(os.getenv("API_PORT", "8000"))
     uvicorn.run(

@@ -41,6 +41,8 @@ class Settings:
     faq_db_path: Path
     sensitive_db_path: Path
     channels_db_path: Path
+    agents_db_path: Path
+    competitor_db_path: Path
     top_k: int
     clarify_threshold: float
     direct_threshold: float
@@ -69,6 +71,11 @@ class Settings:
     wecom_aes_key: str
     wecom_session_prefix: str
     wecom_unsupported_msg_reply: str
+    # --- Redis (optional: JWT blacklist + login rate limit) ---
+    redis_enabled: bool
+    redis_url: str
+    login_rate_limit: int
+    login_rate_window_sec: int
 
     @property
     def score_threshold(self) -> float:
@@ -152,6 +159,16 @@ class Settings:
         if not channels_db_path.is_absolute():
             channels_db_path = PROJECT_ROOT / channels_db_path
 
+        agents_db_path = Path(os.getenv("AGENTS_DB_PATH", "./data/agents.db"))
+        if not agents_db_path.is_absolute():
+            agents_db_path = PROJECT_ROOT / agents_db_path
+
+        competitor_db_path = Path(
+            os.getenv("COMPETITOR_DB_PATH", "./data/competitor.db")
+        )
+        if not competitor_db_path.is_absolute():
+            competitor_db_path = PROJECT_ROOT / competitor_db_path
+
         # Prefer CLARIFY_THRESHOLD; fall back to legacy SCORE_THRESHOLD.
         clarify = float(
             os.getenv("CLARIFY_THRESHOLD")
@@ -195,6 +212,8 @@ class Settings:
             faq_db_path=faq_db_path,
             sensitive_db_path=sensitive_db_path,
             channels_db_path=channels_db_path,
+            agents_db_path=agents_db_path,
+            competitor_db_path=competitor_db_path,
             top_k=int(os.getenv("TOP_K", "4")),
             clarify_threshold=clarify,
             direct_threshold=direct,
@@ -228,6 +247,11 @@ class Settings:
                 "当前仅支持文字消息，请直接输入问题。",
             ).strip()
             or "当前仅支持文字消息，请直接输入问题。",
+            redis_enabled=os.getenv("REDIS_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes", "on"},
+            redis_url=os.getenv("REDIS_URL", os.getenv("MP_AGENT_REDIS_URL", "")).strip(),
+            login_rate_limit=int(os.getenv("LOGIN_RATE_LIMIT", "5")),
+            login_rate_window_sec=int(os.getenv("LOGIN_RATE_WINDOW_SEC", "300")),
         )
 
 

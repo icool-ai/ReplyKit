@@ -1,10 +1,31 @@
-"""Ticket creation tool (SQLite-backed; swap for real HTTP later)."""
+"""Ticket creation tool (SQLAlchemy-backed; swap for real HTTP later)."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from src.tools.business_db import get_connection, get_lock
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from mp_agent.dao.models import Ticket
+from src.tools.business_db import get_lock, get_session
+
+
+def _next_ticket_id(session: Session, prefix: str) -> str:
+    last = session.scalar(
+        select(Ticket.ticket_id)
+        .where(Ticket.ticket_id.like(f"{prefix}%"))
+        .order_by(Ticket.ticket_id.desc())
+        .limit(1)
+    )
+    if last is None:
+        seq = 1
+    else:
+        try:
+            seq = int(str(last)[len(prefix) :]) + 1
+        except ValueError:
+            seq = 1
+    return f"{prefix}{seq:04d}"
 
 
 def create_ticket(
@@ -19,40 +40,17 @@ def create_ticket(
     oid = (order_id or "").strip().upper() or None
     day = datetime.now(timezone.utc).strftime("%Y%m%d")
     prefix = f"TKT{day}"
-    now = datetime.now(timezone.utc).isoformat()
 
     with get_lock():
-        conn = get_connection()
-        conn.execute("BEGIN")
-        try:
-            row = conn.execute(
-                """
-                SELECT ticket_id FROM tickets
-                WHERE ticket_id LIKE ?
-                ORDER BY ticket_id DESC
-                LIMIT 1
-                """,
-                (f"{prefix}%",),
-            ).fetchone()
-            if row is None:
-                seq = 1
-            else:
-                last = str(row["ticket_id"])
-                try:
-                    seq = int(last[len(prefix) :]) + 1
-                except ValueError:
-                    seq = 1
-            ticket_id = f"{prefix}{seq:04d}"
-            conn.execute(
-                """
-                INSERT INTO tickets
-                    (ticket_id, description, order_id, status, created_at)
-                VALUES (?, ?, ?, 'open', ?)
-                """,
-                (ticket_id, text, oid, now),
+        with get_session() as session:
+            ticket_id = _next_ticket_id(session, prefix)
+            session.add(
+                Ticket(
+                    ticket_id=ticket_id,
+                    description=text,
+                    order_id=oid,
+                    status="open",
+                )
             )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+            session.commit()
     return ticket_id

@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onBeforeUnmount, onMounted } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   ChatDotRound,
   ChatLineSquare,
   Connection,
   Document,
+  Goods,
   User,
   Warning,
 } from "@element-plus/icons-vue";
@@ -18,6 +19,7 @@ import {
   getUsername,
   isOps,
 } from "@/auth/session";
+import { mountDifyChatbot, unmountDifyChatbot } from "@/dify/embed";
 
 const route = useRoute();
 const router = useRouter();
@@ -27,12 +29,21 @@ const roleLabel = computed(() => (getRole() === "ops" ? "运营" : "用户"));
 const showOps = computed(() => isOps());
 
 const active = computed(() => {
+  if (route.path.startsWith("/marketplace")) return "/marketplace";
   if (route.path.startsWith("/faqs")) return "/faqs";
   if (route.path.startsWith("/sensitive")) return "/sensitive";
   if (route.path.startsWith("/bot-scripts")) return "/bot-scripts";
   if (route.path.startsWith("/channels")) return "/channels";
   if (route.path.startsWith("/users")) return "/users";
   return "/chat";
+});
+
+onMounted(() => {
+  mountDifyChatbot();
+});
+
+onBeforeUnmount(() => {
+  unmountDifyChatbot();
 });
 
 function onSelect(index: string) {
@@ -46,6 +57,7 @@ async function onLogout() {
   } catch {
     // ignore
   }
+  unmountDifyChatbot();
   clearTokens();
   ElMessage.success("已退出");
   await router.replace("/login");
@@ -61,6 +73,10 @@ async function onLogout() {
         <el-menu-item index="/chat">
           <el-icon><ChatDotRound /></el-icon>
           <span>对话</span>
+        </el-menu-item>
+        <el-menu-item index="/marketplace">
+          <el-icon><Goods /></el-icon>
+          <span>智能体市场</span>
         </el-menu-item>
         <el-menu-item index="/channels">
           <el-icon><Connection /></el-icon>

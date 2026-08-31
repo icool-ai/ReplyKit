@@ -15,7 +15,9 @@ def main() -> None:
     import uvicorn
 
     from src.config import get_settings
+    from src.http_observability import configure_logging
 
+    configure_logging()
     get_settings()  # 启动前校验 API Key 等配置
     host = args.host or os.getenv("API_HOST", "127.0.0.1")
     port = args.port or int(os.getenv("API_PORT", "8000"))
