@@ -1,15 +1,18 @@
-"""FAQ source-of-truth store (P3-3): SQLite CRUD + JSON import."""
+"""FAQ source-of-truth store (P3-3): SQLAlchemy CRUD + JSON import."""
 
 from __future__ import annotations
 
-import json
-import sqlite3
-import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from threading import Lock
 from typing import Any
 
+from sqlalchemy import Engine, func, select
+from sqlalchemy.orm import Session
+
+from mp_agent.dao._helpers import dt_to_unix, utc_now
+from mp_agent.dao.models import Faq
+from mp_agent.dao.sync_db import sync_engine
 from src.config import PROJECT_ROOT
 
 
@@ -66,82 +69,59 @@ class FaqImportResult:
     touched_ids: list[str]
 
 
+def _row_to_faq(faq: Faq) -> FaqRow:
+    similar = list(faq.similar or [])
+    return FaqRow(
+        id=faq.id,
+        category=faq.category,
+        question=faq.question,
+        answer=faq.answer,
+        similar=[str(s).strip() for s in similar if str(s).strip()],
+        enabled=faq.enabled,
+        created_at=dt_to_unix(faq.created_at),
+        updated_at=dt_to_unix(faq.updated_at),
+    )
+
+
+def _normalize_similar(similar: list[str] | None) -> list[str]:
+    if not similar:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in similar:
+        text = str(item or "").strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
 class FaqStore:
-    """SQLite store for structured FAQ entries."""
+    """SQLAlchemy store for structured FAQ entries."""
 
-    def __init__(self, db_path: Path) -> None:
-        self._db_path = Path(db_path)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = Lock()
-        self._conn = sqlite3.connect(
-            str(self._db_path),
-            check_same_thread=False,
-            isolation_level=None,
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._init_schema()
-
-    def _init_schema(self) -> None:
-        with self._lock:
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS faqs (
-                    id TEXT PRIMARY KEY,
-                    category TEXT NOT NULL DEFAULT '',
-                    question TEXT NOT NULL,
-                    answer TEXT NOT NULL,
-                    similar TEXT NOT NULL DEFAULT '[]',
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
-                )
-                """
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_faqs_updated "
-                "ON faqs(updated_at DESC)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_faqs_category "
-                "ON faqs(category)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_faqs_enabled "
-                "ON faqs(enabled)"
-            )
-
-    def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+    def __init__(self, engine: Engine | None = None) -> None:
+        self._engine = engine or sync_engine
 
     def count_enabled(self) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM faqs WHERE enabled = 1"
-            ).fetchone()
-        return int(row["n"] if row else 0)
+        with Session(self._engine) as session:
+            return session.scalar(
+                select(func.count()).where(Faq.enabled.is_(True))
+            ) or 0
 
     def list_enabled(self) -> list[FaqRow]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT * FROM faqs
-                WHERE enabled = 1
-                ORDER BY id ASC
-                """
-            ).fetchall()
-        return [_row_to_faq(r) for r in rows]
+        with Session(self._engine) as session:
+            rows = session.execute(select(Faq).where(Faq.enabled.is_(True)).order_by(Faq.id))
+            return [_row_to_faq(r) for r in rows.scalars()]
 
     def get(self, faq_id: str) -> FaqRow | None:
         faq_id = (faq_id or "").strip()
         if not faq_id:
             return None
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM faqs WHERE id = ?",
-                (faq_id,),
-            ).fetchone()
-        return _row_to_faq(row) if row else None
+        with Session(self._engine) as session:
+            faq = session.get(Faq, faq_id)
+            return _row_to_faq(faq) if faq else None
 
     def list_page(
         self,
@@ -154,47 +134,42 @@ class FaqStore:
     ) -> FaqPage:
         page = max(1, int(page))
         page_size = max(1, min(200, int(page_size)))
-        where: list[str] = []
-        params: list[Any] = []
 
-        if category is not None and str(category).strip():
-            where.append("category = ?")
-            params.append(str(category).strip())
-        if enabled is not None:
-            where.append("enabled = ?")
-            params.append(1 if enabled else 0)
-        if keyword is not None and str(keyword).strip():
-            kw = f"%{str(keyword).strip()}%"
-            where.append(
-                "(question LIKE ? OR answer LIKE ? OR similar LIKE ?)"
-            )
-            params.extend([kw, kw, kw])
+        with Session(self._engine) as session:
+            stmt = select(Faq)
+            count_stmt = select(func.count()).select_from(Faq)
 
-        clause = f"WHERE {' AND '.join(where)}" if where else ""
-        with self._lock:
-            total = int(
-                self._conn.execute(
-                    f"SELECT COUNT(*) AS n FROM faqs {clause}",
-                    params,
-                ).fetchone()["n"]
-            )
+            filters: list[Any] = []
+            if category is not None and str(category).strip():
+                filters.append(Faq.category == str(category).strip())
+            if enabled is not None:
+                filters.append(Faq.enabled.is_(bool(enabled)))
+            if keyword is not None and str(keyword).strip():
+                kw = f"%{str(keyword).strip()}%"
+                filters.append(
+                    (Faq.question.ilike(kw))
+                    | (Faq.answer.ilike(kw))
+                    | (Faq.similar.cast(str).ilike(kw))
+                )
+
+            if filters:
+                for f in filters:
+                    stmt = stmt.where(f)
+                    count_stmt = count_stmt.where(f)
+
+            total = session.scalar(count_stmt) or 0
             offset = (page - 1) * page_size
-            rows = self._conn.execute(
-                f"""
-                SELECT * FROM faqs
-                {clause}
-                ORDER BY updated_at DESC, id ASC
-                LIMIT ? OFFSET ?
-                """,
-                [*params, page_size, offset],
-            ).fetchall()
-
-        return FaqPage(
-            items=[_row_to_faq(r) for r in rows],
-            total=total,
-            page=page,
-            page_size=page_size,
-        )
+            rows = session.execute(
+                stmt.order_by(Faq.updated_at.desc(), Faq.id.asc())
+                .limit(page_size)
+                .offset(offset)
+            )
+            return FaqPage(
+                items=[_row_to_faq(r) for r in rows.scalars()],
+                total=total,
+                page=page,
+                page_size=page_size,
+            )
 
     def create(
         self,
@@ -213,35 +188,27 @@ class FaqStore:
 
         similar_list = _normalize_similar(similar)
         category = (category or "").strip()
-        now = int(time.time())
+        now = utc_now()
+        new_id = (faq_id or "").strip() or self._next_id()
 
-        with self._lock:
-            new_id = (faq_id or "").strip() or self._next_id_unlocked()
-            existing = self._conn.execute(
-                "SELECT 1 FROM faqs WHERE id = ?",
-                (new_id,),
-            ).fetchone()
-            if existing:
+        with Session(self._engine) as session:
+            if session.get(Faq, new_id):
                 raise LookupError(f"FAQ ID 已存在: {new_id}")
 
-            self._conn.execute(
-                """
-                INSERT INTO faqs (
-                    id, category, question, answer, similar,
-                    enabled, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    new_id,
-                    category,
-                    question,
-                    answer,
-                    json.dumps(similar_list, ensure_ascii=False),
-                    1 if enabled else 0,
-                    now,
-                    now,
-                ),
+            session.add(
+                Faq(
+                    id=new_id,
+                    category=category,
+                    question=question,
+                    answer=answer,
+                    similar=similar_list,
+                    enabled=bool(enabled),
+                    created_at=now,
+                    updated_at=now,
+                )
             )
+            session.commit()
+
         row = self.get(new_id)
         assert row is not None
         return row
@@ -264,13 +231,6 @@ class FaqStore:
         if current is None:
             raise KeyError(f"FAQ 不存在: {faq_id}")
 
-        new_question = (
-            current.question if question is None else question.strip()
-        )
-        new_answer = current.answer if answer is None else answer.strip()
-        if not new_question or not new_answer:
-            raise ValueError("question 与 answer 不能为空")
-
         if (
             question is None
             and answer is None
@@ -280,39 +240,31 @@ class FaqStore:
         ):
             raise ValueError("至少需要更新一个字段")
 
-        new_similar = (
-            current.similar if similar is None else _normalize_similar(similar)
-        )
-        new_category = (
-            current.category if category is None else category.strip()
-        )
+        new_question = current.question if question is None else question.strip()
+        new_answer = current.answer if answer is None else answer.strip()
+        if not new_question or not new_answer:
+            raise ValueError("question 与 answer 不能为空")
+        new_similar = current.similar if similar is None else _normalize_similar(similar)
+        new_category = current.category if category is None else category.strip()
         new_enabled = current.enabled if enabled is None else bool(enabled)
-        now = int(time.time())
 
-        with self._lock:
-            self._conn.execute(
-                """
-                UPDATE faqs SET
-                    category = ?, question = ?, answer = ?, similar = ?,
-                    enabled = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    new_category,
-                    new_question,
-                    new_answer,
-                    json.dumps(new_similar, ensure_ascii=False),
-                    1 if new_enabled else 0,
-                    now,
-                    faq_id,
-                ),
-            )
+        with Session(self._engine) as session:
+            faq = session.get(Faq, faq_id)
+            if faq is None:
+                raise KeyError(f"FAQ 不存在: {faq_id}")
+            faq.question = new_question
+            faq.answer = new_answer
+            faq.similar = new_similar
+            faq.category = new_category
+            faq.enabled = new_enabled
+            faq.updated_at = utc_now()
+            session.commit()
+
         row = self.get(faq_id)
         assert row is not None
         return row
 
     def delete_many(self, ids: list[str]) -> list[str]:
-        """Delete existing ids; missing ids are ignored. Returns deleted ids."""
         cleaned: list[str] = []
         seen: set[str] = set()
         for raw in ids:
@@ -325,14 +277,13 @@ class FaqStore:
             raise ValueError("ids 不能为空")
 
         deleted: list[str] = []
-        with self._lock:
+        with Session(self._engine) as session:
             for faq_id in cleaned:
-                cur = self._conn.execute(
-                    "DELETE FROM faqs WHERE id = ?",
-                    (faq_id,),
-                )
-                if cur.rowcount > 0:
+                faq = session.get(Faq, faq_id)
+                if faq is not None:
+                    session.delete(faq)
                     deleted.append(faq_id)
+            session.commit()
         return deleted
 
     def import_entries(self, entries: list[dict[str, Any]]) -> FaqImportResult:
@@ -373,15 +324,16 @@ class FaqStore:
             touched_ids=touched,
         )
 
-    def _next_id_unlocked(self) -> str:
+    def _next_id(self) -> str:
         """Next id as plain decimal string: 1, 2, 3, ..."""
-        rows = self._conn.execute("SELECT id FROM faqs").fetchall()
-        max_n = 0
-        for row in rows:
-            raw = str(row["id"]).strip()
-            if raw.isdigit():
-                max_n = max(max_n, int(raw))
-        return str(max_n + 1)
+        with Session(self._engine) as session:
+            rows = session.execute(select(Faq.id))
+            max_n = 0
+            for (raw,) in rows:
+                text = str(raw).strip()
+                if text.isdigit():
+                    max_n = max(max_n, int(text))
+            return str(max_n + 1)
 
 
 def load_faq_entries_from_path(path: Path) -> list[dict[str, Any]]:
@@ -404,38 +356,16 @@ def resolve_import_path(path: str) -> Path:
     return p.resolve()
 
 
-def _normalize_similar(similar: list[str] | None) -> list[str]:
-    if not similar:
-        return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for item in similar:
-        text = str(item or "").strip()
-        key = text.lower()
-        if not text or key in seen:
-            continue
-        seen.add(key)
-        out.append(text)
-    return out
+@lru_cache(maxsize=4)
+def _get_faq_store_cached(engine_identity: str) -> FaqStore:
+    return FaqStore(sync_engine)
 
 
-def _row_to_faq(row: sqlite3.Row) -> FaqRow:
-    similar_raw = row["similar"] or "[]"
-    try:
-        similar = json.loads(similar_raw)
-    except json.JSONDecodeError:
-        similar = []
-    if isinstance(similar, str):
-        similar = [similar]
-    if not isinstance(similar, list):
-        similar = []
-    return FaqRow(
-        id=str(row["id"]),
-        category=str(row["category"] or ""),
-        question=str(row["question"] or ""),
-        answer=str(row["answer"] or ""),
-        similar=[str(s).strip() for s in similar if str(s).strip()],
-        enabled=bool(row["enabled"]),
-        created_at=int(row["created_at"]),
-        updated_at=int(row["updated_at"]),
-    )
+def get_faq_store(engine: Engine | None = None) -> FaqStore:
+    """Shared store (engine-normalized). Pass None for default sync engine."""
+    return FaqStore(engine)
+
+
+def reload_faq_store() -> FaqStore:
+    _get_faq_store_cached.cache_clear()
+    return get_faq_store()

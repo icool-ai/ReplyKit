@@ -1,74 +1,38 @@
-"""Per-owner channel connector config (Feishu first; WeCom later).
-
-Each logged-in user owns at most one row per channel. A non-empty Feishu
-``app_id`` may be bound to only one owner; others get AppIdTakenError.
-Webhook routing: fixed ``POST /webhooks/feishu``; resolve config by
-App ID / Verification Token (``id`` remains an internal primary key).
-"""
+"""Channel configuration + Feishu user tokens + Dify API keys + settings (SQLAlchemy)."""
 
 from __future__ import annotations
 
 import secrets
-import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from threading import Lock
 from typing import Any
 
+from sqlalchemy import Engine, and_, func, select
+from sqlalchemy.orm import Session
+
+from mp_agent.dao._helpers import dt_to_unix, utc_now
+from mp_agent.dao.models import (
+    ChannelConfig,
+    DifyApiKey,
+    FeishuUserToken,
+    PlatformSetting,
+)
+from mp_agent.dao.sync_db import sync_engine
 from src.config import PROJECT_ROOT
 
 CHANNEL_FEISHU = "feishu"
-FEISHU_CALLBACK_PATH = "/webhooks/feishu"
-SETTING_DIFY_RETRIEVAL_API_KEY = "dify_retrieval_api_key"  # legacy single-key
 
 
 @dataclass(frozen=True)
-class DifyApiKeyRow:
-    id: str
-    name: str
-    endpoint: str
-    knowledge_id: str
-    api_key: str
-    created_at: int
-    updated_at: int
-    last_used_at: int | None
+class AppIdTakenError(ValueError):
+    app_id: str
+    taken_by: str
 
-    def to_public_dict(self, *, api_key_plaintext: str | None = None) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "id": self.id,
-            "name": self.name,
-            "endpoint": self.endpoint,
-            "knowledge_id": self.knowledge_id,
-            "api_key_masked": _mask_api_key(self.api_key),
-            "api_key_set": True,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "last_used_at": self.last_used_at,
-        }
-        if api_key_plaintext is not None:
-            out["api_key"] = api_key_plaintext
-        return out
-
-
-def _mask_api_key(api_key: str) -> str:
-    key = api_key.strip()
-    if len(key) <= 12:
-        return "*" * len(key) if key else ""
-    return f"{key[:10]}{'*' * max(8, len(key) - 14)}{key[-4:]}"
-
-
-class AppIdTakenError(Exception):
-    """Another user already bound this Feishu App ID."""
-
-    def __init__(self, app_id: str, owner_username: str) -> None:
-        self.app_id = app_id
-        self.owner_username = owner_username
-        super().__init__(
-            f"App ID「{app_id}」已被用户「{owner_username}」绑定，仅对方可修改"
-        )
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return f"AppId 已被其他账号占用: {self.app_id} ({self.taken_by})"
 
 
 @dataclass(frozen=True)
@@ -84,22 +48,6 @@ class ChannelConfigRow:
     created_at: int
     updated_at: int
 
-    def to_public_dict(self) -> dict[str, Any]:
-        """API response shape: never expose secret plaintext."""
-        return {
-            "id": self.id,
-            "owner_username": self.owner_username,
-            "channel": self.channel,
-            "enabled": self.enabled,
-            "app_id": self.app_id,
-            "app_secret_set": bool(self.app_secret.strip()),
-            "verification_token_set": bool(self.verification_token.strip()),
-            "encrypt_key_set": bool(self.encrypt_key.strip()),
-            "callback_path": FEISHU_CALLBACK_PATH,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-        }
-
 
 @dataclass(frozen=True)
 class FeishuUserTokenRow:
@@ -112,218 +60,73 @@ class FeishuUserTokenRow:
     updated_at: int
 
 
+@dataclass(frozen=True)
+class DifyApiKeyRow:
+    id: str
+    name: str
+    endpoint: str
+    knowledge_id: str
+    api_key: str
+    created_at: int
+    updated_at: int
+    last_used_at: int | None
+
+
 class ChannelStore:
-    """SQLite store for channel credentials, isolated by owner_username."""
+    """SQLAlchemy-backed store for channel configs and Dify API keys."""
 
-    def __init__(self, db_path: Path) -> None:
-        self._db_path = Path(db_path)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = Lock()
-        self._conn = sqlite3.connect(
-            str(self._db_path),
-            check_same_thread=False,
-            isolation_level=None,
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._init_schema()
+    def __init__(self, engine: Engine | None = None) -> None:
+        self._engine = engine or sync_engine
 
-    def _init_schema(self) -> None:
-        with self._lock:
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS channel_configs (
-                    id TEXT PRIMARY KEY,
-                    owner_username TEXT NOT NULL,
-                    channel TEXT NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 0,
-                    app_id TEXT NOT NULL DEFAULT '',
-                    app_secret TEXT NOT NULL DEFAULT '',
-                    verification_token TEXT NOT NULL DEFAULT '',
-                    encrypt_key TEXT NOT NULL DEFAULT '',
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    UNIQUE(owner_username, channel)
-                )
-                """
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_channel_owner "
-                "ON channel_configs(owner_username)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_channel_enabled "
-                "ON channel_configs(channel, enabled)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_channel_app_id "
-                "ON channel_configs(channel, app_id)"
-            )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS feishu_user_tokens (
-                    config_id TEXT NOT NULL,
-                    open_id TEXT NOT NULL,
-                    access_token TEXT NOT NULL DEFAULT '',
-                    refresh_token TEXT NOT NULL DEFAULT '',
-                    expires_at INTEGER NOT NULL DEFAULT 0,
-                    refresh_expires_at INTEGER,
-                    updated_at INTEGER NOT NULL,
-                    PRIMARY KEY (config_id, open_id)
-                )
-                """
-            )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS platform_settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL DEFAULT '',
-                    updated_at INTEGER NOT NULL
-                )
-                """
-            )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS dify_api_keys (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    endpoint TEXT NOT NULL,
-                    knowledge_id TEXT NOT NULL,
-                    api_key TEXT NOT NULL UNIQUE,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    last_used_at INTEGER
-                )
-                """
-            )
-            self._migrate_legacy_dify_key()
+    def get_setting(self, key: str) -> str:
+        k = key.strip()
+        if not k:
+            return ""
+        with Session(self._engine) as db:
+            row = db.get(PlatformSetting, k)
+            return str(row.value) if row and row.value is not None else ""
 
-    def _migrate_legacy_dify_key(self) -> None:
-        """One-shot: move platform_settings single key into dify_api_keys."""
-        row = self._conn.execute(
-            "SELECT value, updated_at FROM platform_settings WHERE key = ?",
-            (SETTING_DIFY_RETRIEVAL_API_KEY,),
-        ).fetchone()
-        if row is None:
+    def set_setting(self, key: str, value: str) -> None:
+        k = key.strip()
+        if not k:
             return
-        legacy = str(row["value"] or "").strip()
-        if not legacy:
-            self._conn.execute(
-                "DELETE FROM platform_settings WHERE key = ?",
-                (SETTING_DIFY_RETRIEVAL_API_KEY,),
-            )
-            return
-        exists = self._conn.execute(
-            "SELECT 1 FROM dify_api_keys WHERE api_key = ? LIMIT 1",
-            (legacy,),
-        ).fetchone()
-        if exists is None:
-            now = int(row["updated_at"] or time.time())
-            self._conn.execute(
-                """
-                INSERT INTO dify_api_keys
-                (id, name, endpoint, knowledge_id, api_key,
-                 created_at, updated_at, last_used_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
-                """,
-                (
-                    uuid.uuid4().hex,
-                    "迁移自旧配置",
-                    "",
-                    "faq",
-                    legacy,
-                    now,
-                    now,
-                ),
-            )
-        self._conn.execute(
-            "DELETE FROM platform_settings WHERE key = ?",
-            (SETTING_DIFY_RETRIEVAL_API_KEY,),
-        )
-
-    def get_setting(self, key: str) -> tuple[str, int] | None:
-        """Return ``(value, updated_at)`` or None if missing / empty key."""
-        k = key.strip()
-        if not k:
-            return None
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT value, updated_at FROM platform_settings WHERE key = ?",
-                (k,),
-            ).fetchone()
-        if row is None:
-            return None
-        return str(row["value"] or ""), int(row["updated_at"] or 0)
-
-    def set_setting(self, key: str, value: str) -> int:
-        """Upsert setting; returns updated_at."""
-        k = key.strip()
-        if not k:
-            raise ValueError("setting key 不能为空")
-        now = int(time.time())
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO platform_settings (key, value, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value,
-                    updated_at = excluded.updated_at
-                """,
-                (k, value, now),
-            )
-        return now
-
-    def delete_setting(self, key: str) -> bool:
-        k = key.strip()
-        if not k:
-            return False
-        with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM platform_settings WHERE key = ?",
-                (k,),
-            )
-            return cur.rowcount > 0
-
-    def get_dify_retrieval_api_key(self) -> str:
-        """Deprecated single-key helper; prefer ``find_dify_api_key``."""
-        rows = self.list_dify_api_keys()
-        return rows[0].api_key if rows else ""
+        now = utc_now()
+        with Session(self._engine) as db:
+            row = db.get(PlatformSetting, k)
+            if row is None:
+                db.add(PlatformSetting(key=k, value=str(value or ""), updated_at=now))
+            else:
+                row.value = str(value or "")
+                row.updated_at = now
+            db.commit()
 
     def list_dify_api_keys(self) -> list[DifyApiKeyRow]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT * FROM dify_api_keys
-                ORDER BY created_at DESC
-                """
-            ).fetchall()
-        return [_row_to_dify_key(r) for r in rows]
+        with Session(self._engine) as db:
+            rows = db.execute(
+                select(DifyApiKey).order_by(DifyApiKey.created_at.desc(), DifyApiKey.id)
+            ).scalars().all()
+            return [_model_to_dify_key(r) for r in rows]
 
     def get_dify_api_key(self, key_id: str) -> DifyApiKeyRow | None:
         kid = key_id.strip()
         if not kid:
             return None
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM dify_api_keys WHERE id = ?",
-                (kid,),
-            ).fetchone()
-        return _row_to_dify_key(row) if row else None
+        with Session(self._engine) as db:
+            row = db.get(DifyApiKey, kid)
+            return _model_to_dify_key(row) if row else None
 
     def find_dify_api_key_by_secret(self, api_key: str) -> DifyApiKeyRow | None:
         provided = api_key.strip()
         if not provided:
             return None
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM dify_api_keys"
-            ).fetchall()
+        with Session(self._engine) as db:
+            rows = db.execute(select(DifyApiKey)).scalars().all()
         for row in rows:
-            stored = str(row["api_key"] or "")
+            stored = str(row.api_key or "")
             if len(stored) == len(provided) and secrets.compare_digest(
                 stored, provided
             ):
-                return _row_to_dify_key(row)
+                return _model_to_dify_key(row)
         return None
 
     def create_dify_api_key(
@@ -346,24 +149,25 @@ class ChannelStore:
         if low.rstrip("/").endswith("/retrieval"):
             raise ValueError("API Endpoint 不要带 /retrieval 后缀")
         plaintext = f"rk_dify_{secrets.token_urlsafe(32)}"
-        now = int(time.time())
         row_id = uuid.uuid4().hex
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO dify_api_keys
-                (id, name, endpoint, knowledge_id, api_key,
-                 created_at, updated_at, last_used_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
-                """,
-                (row_id, n, ep, kid, plaintext, now, now),
+        now = utc_now()
+        with Session(self._engine) as db:
+            db.add(
+                DifyApiKey(
+                    id=row_id,
+                    name=n,
+                    endpoint=ep,
+                    knowledge_id=kid,
+                    api_key=plaintext,
+                    created_at=now,
+                    updated_at=now,
+                    last_used_at=None,
+                )
             )
-            row = self._conn.execute(
-                "SELECT * FROM dify_api_keys WHERE id = ?",
-                (row_id,),
-            ).fetchone()
-        assert row is not None
-        return plaintext, _row_to_dify_key(row)
+            db.commit()
+            created = db.get(DifyApiKey, row_id)
+            assert created is not None
+            return plaintext, _model_to_dify_key(created)
 
     def update_dify_api_key(
         self,
@@ -376,14 +180,10 @@ class ChannelStore:
         kid = key_id.strip()
         if not kid:
             raise KeyError("配置不存在")
-        with self._lock:
-            existing_row = self._conn.execute(
-                "SELECT * FROM dify_api_keys WHERE id = ?",
-                (kid,),
-            ).fetchone()
-            if existing_row is None:
+        with Session(self._engine) as db:
+            existing = db.get(DifyApiKey, kid)
+            if existing is None:
                 raise KeyError("配置不存在")
-            existing = _row_to_dify_key(existing_row)
             new_name = existing.name if name is None else name.strip()
             new_ep = (
                 existing.endpoint
@@ -404,51 +204,38 @@ class ChannelStore:
                 raise ValueError("API Endpoint 须以 http:// 或 https:// 开头")
             if low.rstrip("/").endswith("/retrieval"):
                 raise ValueError("API Endpoint 不要带 /retrieval 后缀")
-            now = int(time.time())
-            self._conn.execute(
-                """
-                UPDATE dify_api_keys
-                SET name = ?, endpoint = ?, knowledge_id = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (new_name, new_ep, new_kid, now, existing.id),
-            )
-            row = self._conn.execute(
-                "SELECT * FROM dify_api_keys WHERE id = ?",
-                (existing.id,),
-            ).fetchone()
-        assert row is not None
-        return _row_to_dify_key(row)
+            existing.name = new_name
+            existing.endpoint = new_ep
+            existing.knowledge_id = new_kid
+            existing.updated_at = utc_now()
+            db.commit()
+            return _model_to_dify_key(existing)
 
     def delete_dify_api_key(self, key_id: str) -> bool:
         kid = key_id.strip()
         if not kid:
             return False
-        with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM dify_api_keys WHERE id = ?",
-                (kid,),
-            )
-            return cur.rowcount > 0
+        with Session(self._engine) as db:
+            row = db.get(DifyApiKey, kid)
+            if row is None:
+                return False
+            db.delete(row)
+            db.commit()
+            return True
 
     def touch_dify_api_key_used(self, key_id: str) -> None:
         kid = key_id.strip()
         if not kid:
             return
-        now = int(time.time())
-        with self._lock:
-            self._conn.execute(
-                """
-                UPDATE dify_api_keys
-                SET last_used_at = ?
-                WHERE id = ?
-                """,
-                (now, kid),
-            )
+        now = utc_now()
+        with Session(self._engine) as db:
+            row = db.get(DifyApiKey, kid)
+            if row is not None:
+                row.last_used_at = now
+                db.commit()
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        return None
 
     def get_for_owner(
         self, owner_username: str, channel: str = CHANNEL_FEISHU
@@ -456,26 +243,24 @@ class ChannelStore:
         owner = owner_username.strip()
         if not owner:
             return None
-        with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT * FROM channel_configs
-                WHERE owner_username = ? AND channel = ?
-                """,
-                (owner, channel),
-            ).fetchone()
-        return _row_to_config(row) if row else None
+        with Session(self._engine) as db:
+            row = db.scalar(
+                select(ChannelConfig).where(
+                    and_(
+                        ChannelConfig.owner_username == owner,
+                        ChannelConfig.channel == channel,
+                    )
+                )
+            )
+            return _model_to_config(row) if row else None
 
     def get_by_id(self, config_id: str) -> ChannelConfigRow | None:
         cid = config_id.strip()
         if not cid:
             return None
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM channel_configs WHERE id = ?",
-                (cid,),
-            ).fetchone()
-        return _row_to_config(row) if row else None
+        with Session(self._engine) as db:
+            row = db.get(ChannelConfig, cid)
+            return _model_to_config(row) if row else None
 
     def find_by_app_id(
         self, app_id: str, *, channel: str = CHANNEL_FEISHU
@@ -483,16 +268,13 @@ class ChannelStore:
         aid = app_id.strip()
         if not aid:
             return None
-        with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT * FROM channel_configs
-                WHERE channel = ? AND app_id = ?
-                LIMIT 1
-                """,
-                (channel, aid),
-            ).fetchone()
-        return _row_to_config(row) if row else None
+        with Session(self._engine) as db:
+            row = db.scalar(
+                select(ChannelConfig).where(
+                    and_(ChannelConfig.channel == channel, ChannelConfig.app_id == aid)
+                )
+            )
+            return _model_to_config(row) if row else None
 
     def find_by_verification_token(
         self, token: str, *, channel: str = CHANNEL_FEISHU
@@ -500,38 +282,35 @@ class ChannelStore:
         tok = token.strip()
         if not tok:
             return None
-        with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT * FROM channel_configs
-                WHERE channel = ? AND verification_token = ?
-                LIMIT 1
-                """,
-                (channel, tok),
-            ).fetchone()
-        return _row_to_config(row) if row else None
+        with Session(self._engine) as db:
+            row = db.scalar(
+                select(ChannelConfig).where(
+                    and_(
+                        ChannelConfig.channel == channel,
+                        ChannelConfig.verification_token == tok,
+                    )
+                )
+            )
+            return _model_to_config(row) if row else None
 
     def list_enabled_feishu(self) -> list[ChannelConfigRow]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT * FROM channel_configs
-                WHERE channel = ? AND enabled = 1
-                """,
-                (CHANNEL_FEISHU,),
-            ).fetchall()
-        return [_row_to_config(r) for r in rows]
+        with Session(self._engine) as db:
+            rows = db.execute(
+                select(ChannelConfig).where(
+                    and_(
+                        ChannelConfig.channel == CHANNEL_FEISHU,
+                        ChannelConfig.enabled.is_(True),
+                    )
+                )
+            ).scalars().all()
+            return [_model_to_config(r) for r in rows]
 
     def list_feishu(self) -> list[ChannelConfigRow]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT * FROM channel_configs
-                WHERE channel = ?
-                """,
-                (CHANNEL_FEISHU,),
-            ).fetchall()
-        return [_row_to_config(r) for r in rows]
+        with Session(self._engine) as db:
+            rows = db.execute(
+                select(ChannelConfig).where(ChannelConfig.channel == CHANNEL_FEISHU)
+            ).scalars().all()
+            return [_model_to_config(r) for r in rows]
 
     def find_app_id_holder(
         self,
@@ -540,30 +319,17 @@ class ChannelStore:
         channel: str = CHANNEL_FEISHU,
         exclude_owner: str | None = None,
     ) -> ChannelConfigRow | None:
-        """Return another owner's row that already binds this app_id."""
         aid = app_id.strip()
         if not aid:
             return None
-        with self._lock:
+        with Session(self._engine) as db:
+            stmt = select(ChannelConfig).where(
+                and_(ChannelConfig.channel == channel, ChannelConfig.app_id == aid)
+            )
             if exclude_owner:
-                row = self._conn.execute(
-                    """
-                    SELECT * FROM channel_configs
-                    WHERE channel = ? AND app_id = ? AND owner_username != ?
-                    LIMIT 1
-                    """,
-                    (channel, aid, exclude_owner.strip()),
-                ).fetchone()
-            else:
-                row = self._conn.execute(
-                    """
-                    SELECT * FROM channel_configs
-                    WHERE channel = ? AND app_id = ?
-                    LIMIT 1
-                    """,
-                    (channel, aid),
-                ).fetchone()
-        return _row_to_config(row) if row else None
+                stmt = stmt.where(ChannelConfig.owner_username != exclude_owner.strip())
+            row = db.scalar(stmt)
+            return _model_to_config(row) if row else None
 
     def upsert_feishu(
         self,
@@ -575,19 +341,12 @@ class ChannelStore:
         verification_token: str | None,
         encrypt_key: str | None,
     ) -> ChannelConfigRow:
-        """Create or update Feishu config for this owner.
-
-        Secret fields: ``None`` means keep existing.
-        Non-empty ``app_id`` is exclusive to one owner (AppIdTakenError).
-        Clear ``app_id`` (empty string while saving) to release the binding
-        so others may claim it later.
-        """
         owner = owner_username.strip()
         if not owner:
             raise ValueError("owner_username 不能为空")
 
         existing = self.get_for_owner(owner, CHANNEL_FEISHU)
-        now = int(time.time())
+        now = utc_now()
         app_id_v = app_id.strip()
 
         if existing is None:
@@ -598,31 +357,25 @@ class ChannelStore:
                 _require_feishu_ready(app_id_v, secret, token)
             self._ensure_app_id_available(app_id_v, owner)
             config_id = uuid.uuid4().hex
-            with self._lock:
-                self._conn.execute(
-                    """
-                    INSERT INTO channel_configs (
-                        id, owner_username, channel, enabled,
-                        app_id, app_secret, verification_token, encrypt_key,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        config_id,
-                        owner,
-                        CHANNEL_FEISHU,
-                        1 if enabled else 0,
-                        app_id_v,
-                        secret,
-                        token,
-                        enc,
-                        now,
-                        now,
-                    ),
+            with Session(self._engine) as db:
+                db.add(
+                    ChannelConfig(
+                        id=config_id,
+                        owner_username=owner,
+                        channel=CHANNEL_FEISHU,
+                        enabled=bool(enabled),
+                        app_id=app_id_v,
+                        app_secret=secret,
+                        verification_token=token,
+                        encrypt_key=enc,
+                        created_at=now,
+                        updated_at=now,
+                    )
                 )
-            row = self.get_by_id(config_id)
-            assert row is not None
-            return row
+                db.commit()
+                row = db.get(ChannelConfig, config_id)
+                assert row is not None
+                return _model_to_config(row)
 
         secret = (
             existing.app_secret
@@ -641,31 +394,18 @@ class ChannelStore:
             _require_feishu_ready(app_id_v, secret, token)
         self._ensure_app_id_available(app_id_v, owner)
 
-        with self._lock:
-            self._conn.execute(
-                """
-                UPDATE channel_configs SET
-                    enabled = ?,
-                    app_id = ?,
-                    app_secret = ?,
-                    verification_token = ?,
-                    encrypt_key = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    1 if enabled else 0,
-                    app_id_v,
-                    secret,
-                    token,
-                    enc,
-                    now,
-                    existing.id,
-                ),
-            )
-        row = self.get_by_id(existing.id)
-        assert row is not None
-        return row
+        with Session(self._engine) as db:
+            row = db.get(ChannelConfig, existing.id)
+            if row is None:
+                raise KeyError("配置不存在")
+            row.enabled = bool(enabled)
+            row.app_id = app_id_v
+            row.app_secret = secret
+            row.verification_token = token
+            row.encrypt_key = enc
+            row.updated_at = now
+            db.commit()
+            return _model_to_config(row)
 
     def _ensure_app_id_available(self, app_id: str, owner: str) -> None:
         if not app_id:
@@ -681,15 +421,16 @@ class ChannelStore:
         oid = open_id.strip()
         if not cid or not oid:
             return None
-        with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT * FROM feishu_user_tokens
-                WHERE config_id = ? AND open_id = ?
-                """,
-                (cid, oid),
-            ).fetchone()
-        return _row_to_user_token(row) if row else None
+        with Session(self._engine) as db:
+            row = db.scalar(
+                select(FeishuUserToken).where(
+                    and_(
+                        FeishuUserToken.config_id == cid,
+                        FeishuUserToken.open_id == oid,
+                    )
+                )
+            )
+            return _model_to_user_token(row) if row else None
 
     def upsert_feishu_user_token(
         self,
@@ -705,52 +446,61 @@ class ChannelStore:
         oid = open_id.strip()
         if not cid or not oid:
             raise ValueError("config_id 与 open_id 不能为空")
-        now = int(time.time())
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO feishu_user_tokens (
-                    config_id, open_id, access_token, refresh_token,
-                    expires_at, refresh_expires_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(config_id, open_id) DO UPDATE SET
-                    access_token = excluded.access_token,
-                    refresh_token = excluded.refresh_token,
-                    expires_at = excluded.expires_at,
-                    refresh_expires_at = excluded.refresh_expires_at,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    cid,
-                    oid,
-                    access_token.strip(),
-                    refresh_token.strip(),
-                    int(expires_at),
-                    (
+        now = utc_now()
+        with Session(self._engine) as db:
+            row = db.scalar(
+                select(FeishuUserToken).where(
+                    and_(
+                        FeishuUserToken.config_id == cid,
+                        FeishuUserToken.open_id == oid,
+                    )
+                )
+            )
+            if row is None:
+                row = FeishuUserToken(
+                    config_id=cid,
+                    open_id=oid,
+                    access_token=access_token.strip(),
+                    refresh_token=refresh_token.strip(),
+                    expires_at=int(expires_at),
+                    refresh_expires_at=(
                         int(refresh_expires_at)
                         if refresh_expires_at is not None
                         else None
                     ),
-                    now,
-                ),
-            )
-        row = self.get_feishu_user_token(cid, oid)
-        assert row is not None
-        return row
+                    updated_at=now,
+                )
+                db.add(row)
+            else:
+                row.access_token = access_token.strip()
+                row.refresh_token = refresh_token.strip()
+                row.expires_at = int(expires_at)
+                row.refresh_expires_at = (
+                    int(refresh_expires_at)
+                    if refresh_expires_at is not None
+                    else None
+                )
+                row.updated_at = now
+            db.commit()
+            return _model_to_user_token(row)
 
     def delete_feishu_user_token(self, config_id: str, open_id: str) -> None:
         cid = config_id.strip()
         oid = open_id.strip()
         if not cid or not oid:
             return
-        with self._lock:
-            self._conn.execute(
-                """
-                DELETE FROM feishu_user_tokens
-                WHERE config_id = ? AND open_id = ?
-                """,
-                (cid, oid),
+        with Session(self._engine) as db:
+            row = db.scalar(
+                select(FeishuUserToken).where(
+                    and_(
+                        FeishuUserToken.config_id == cid,
+                        FeishuUserToken.open_id == oid,
+                    )
+                )
             )
+            if row is not None:
+                db.delete(row)
+                db.commit()
 
 
 def _require_feishu_ready(app_id: str, secret: str, token: str) -> None:
@@ -767,51 +517,51 @@ def _require_feishu_ready(app_id: str, secret: str, token: str) -> None:
         )
 
 
-def _row_to_dify_key(row: sqlite3.Row) -> DifyApiKeyRow:
-    last_used = row["last_used_at"]
+def _model_to_dify_key(m: DifyApiKey) -> DifyApiKeyRow:
+    last_used = dt_to_unix(m.last_used_at) if m.last_used_at else None
     return DifyApiKeyRow(
-        id=str(row["id"]),
-        name=str(row["name"] or ""),
-        endpoint=str(row["endpoint"] or ""),
-        knowledge_id=str(row["knowledge_id"] or ""),
-        api_key=str(row["api_key"] or ""),
-        created_at=int(row["created_at"] or 0),
-        updated_at=int(row["updated_at"] or 0),
-        last_used_at=int(last_used) if last_used is not None else None,
+        id=str(m.id),
+        name=str(m.name or ""),
+        endpoint=str(m.endpoint or ""),
+        knowledge_id=str(m.knowledge_id or ""),
+        api_key=str(m.api_key or ""),
+        created_at=dt_to_unix(m.created_at),
+        updated_at=dt_to_unix(m.updated_at),
+        last_used_at=last_used,
     )
 
 
-def _row_to_config(row: sqlite3.Row) -> ChannelConfigRow:
+def _model_to_config(m: ChannelConfig) -> ChannelConfigRow:
     return ChannelConfigRow(
-        id=str(row["id"]),
-        owner_username=str(row["owner_username"]),
-        channel=str(row["channel"]),
-        enabled=bool(row["enabled"]),
-        app_id=str(row["app_id"] or ""),
-        app_secret=str(row["app_secret"] or ""),
-        verification_token=str(row["verification_token"] or ""),
-        encrypt_key=str(row["encrypt_key"] or ""),
-        created_at=int(row["created_at"]),
-        updated_at=int(row["updated_at"]),
+        id=str(m.id),
+        owner_username=str(m.owner_username),
+        channel=str(m.channel),
+        enabled=bool(m.enabled),
+        app_id=str(m.app_id or ""),
+        app_secret=str(m.app_secret or ""),
+        verification_token=str(m.verification_token or ""),
+        encrypt_key=str(m.encrypt_key or ""),
+        created_at=dt_to_unix(m.created_at),
+        updated_at=dt_to_unix(m.updated_at),
     )
 
 
-def _row_to_user_token(row: sqlite3.Row) -> FeishuUserTokenRow:
-    refresh_exp = row["refresh_expires_at"]
+def _model_to_user_token(m: FeishuUserToken) -> FeishuUserTokenRow:
     return FeishuUserTokenRow(
-        config_id=str(row["config_id"]),
-        open_id=str(row["open_id"]),
-        access_token=str(row["access_token"] or ""),
-        refresh_token=str(row["refresh_token"] or ""),
-        expires_at=int(row["expires_at"] or 0),
-        refresh_expires_at=int(refresh_exp) if refresh_exp is not None else None,
-        updated_at=int(row["updated_at"] or 0),
+        config_id=str(m.config_id),
+        open_id=str(m.open_id),
+        access_token=str(m.access_token or ""),
+        refresh_token=str(m.refresh_token or ""),
+        expires_at=int(m.expires_at or 0),
+        refresh_expires_at=(
+            int(m.refresh_expires_at) if m.refresh_expires_at is not None else None
+        ),
+        updated_at=dt_to_unix(m.updated_at),
     )
 
 
 @lru_cache(maxsize=4)
-def get_channel_store(db_path: str | Path) -> ChannelStore:
-    path = Path(db_path)
-    if not path.is_absolute():
-        path = PROJECT_ROOT / path
-    return ChannelStore(path)
+def get_channel_store(engine_identity: str = "default") -> ChannelStore:
+    """Shared store (identity string for cache key only)."""
+    _ = engine_identity
+    return ChannelStore(sync_engine)

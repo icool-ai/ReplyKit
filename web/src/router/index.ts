@@ -29,6 +29,12 @@ const router = createRouter({
           meta: { title: '对话' },
         },
         {
+          path: 'marketplace',
+          name: 'marketplace',
+          component: () => import('@/views/MarketplaceView.vue'),
+          meta: { title: '智能体市场' },
+        },
+        {
           path: 'faqs',
           name: 'faqs',
           component: () => import('@/views/FaqsView.vue'),

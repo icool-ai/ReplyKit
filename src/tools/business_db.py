@@ -1,14 +1,19 @@
-"""SQLite business DB: orders + tickets (P2-3)."""
+"""Business DB: orders + tickets (SQLAlchemy)."""
 
 from __future__ import annotations
 
-import sqlite3
-from pathlib import Path
+from contextlib import contextmanager
 from threading import Lock
+from typing import Generator
 
-_lock = Lock()
-_conn: sqlite3.Connection | None = None
-_db_path: Path | None = None
+from sqlalchemy import Engine
+from sqlalchemy.orm import Session
+
+from mp_agent.dao.models import Order
+from mp_agent.dao.sync_db import sync_engine
+
+
+_dummy_lock = Lock()
 
 SEED_ORDERS: list[dict[str, str]] = [
     {
@@ -37,83 +42,51 @@ SEED_ORDERS: list[dict[str, str]] = [
     },
 ]
 
+_engine: Engine | None = None
 
-def configure_business_db(db_path: Path) -> None:
+
+def configure_business_db(engine: Engine | None = None) -> None:
     """Open (or reopen) the business DB and ensure schema + seed data."""
-    global _conn, _db_path
-    path = Path(db_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with _lock:
-        if _conn is not None and _db_path == path:
-            return
-        if _conn is not None:
-            _conn.close()
-        _db_path = path
-        _conn = sqlite3.connect(
-            str(path),
-            check_same_thread=False,
-            isolation_level=None,
-        )
-        _conn.row_factory = sqlite3.Row
-        _init_schema(_conn)
-        _seed_orders(_conn)
+    global _engine
+    _engine = engine or sync_engine
+    _seed_orders()
 
 
-def get_connection() -> sqlite3.Connection:
-    if _conn is None:
+def get_engine() -> Engine:
+    if _engine is None:
         raise RuntimeError(
             "业务库未初始化：请先调用 configure_business_db(settings.business_db_path)。"
         )
-    return _conn
+    return _engine
+
+
+@contextmanager
+def get_session() -> Generator[Session, None, None]:
+    """Return a transactional SQLAlchemy session for business DB operations."""
+    with Session(get_engine()) as session:
+        yield session
 
 
 def get_lock() -> Lock:
-    return _lock
+    """Backward-compatible no-op lock (SQLAlchemy handles transaction isolation)."""
+    return _dummy_lock
 
 
-def _init_schema(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS orders (
-            order_id TEXT PRIMARY KEY,
-            status TEXT NOT NULL,
-            carrier TEXT NOT NULL DEFAULT '',
-            tracking_no TEXT NOT NULL DEFAULT '',
-            eta TEXT NOT NULL DEFAULT '',
-            last_event TEXT NOT NULL DEFAULT ''
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS tickets (
-            ticket_id TEXT PRIMARY KEY,
-            description TEXT NOT NULL,
-            order_id TEXT,
-            status TEXT NOT NULL DEFAULT 'open',
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-
-
-def _seed_orders(conn: sqlite3.Connection) -> None:
-    count = conn.execute("SELECT COUNT(*) AS n FROM orders").fetchone()["n"]
-    if count > 0:
-        return
-    for row in SEED_ORDERS:
-        conn.execute(
-            """
-            INSERT INTO orders
-                (order_id, status, carrier, tracking_no, eta, last_event)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                row["order_id"],
-                row["status"],
-                row["carrier"],
-                row["tracking_no"],
-                row["eta"],
-                row["last_event"],
-            ),
-        )
+def _seed_orders() -> None:
+    engine = get_engine()
+    with Session(engine) as session:
+        count = session.query(Order).count()
+        if count > 0:
+            return
+        for row in SEED_ORDERS:
+            session.add(
+                Order(
+                    order_id=row["order_id"],
+                    status=row["status"],
+                    carrier=row["carrier"],
+                    tracking_no=row["tracking_no"],
+                    eta=row["eta"],
+                    last_event=row["last_event"],
+                )
+            )
+        session.commit()

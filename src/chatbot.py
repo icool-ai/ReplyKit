@@ -255,7 +255,7 @@ class CustomerServiceBot:
         self.ticket_flow = TicketCreateFlow()
         self.feishu_task_flow = FeishuTaskFlow()
         self.channel_ctx = None  # set/cleared by API under bot_lock
-        configure_business_db(settings.business_db_path)
+        configure_business_db()
         self._ensure_vectorstore()
 
     def reset_session(self) -> None:
