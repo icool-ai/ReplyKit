@@ -69,9 +69,15 @@ def register_exception_handlers(app: Any) -> None:
         request: Request, exc: StarletteHTTPException
     ) -> JSONResponse:
         detail = exc.detail
-        if isinstance(detail, (list, dict)):
-            message = "请求失败"
+        if isinstance(detail, dict):
+            # 业务代码已经把清晰提示语放到 detail 里（如 {"message":"..."}）
+            # 为了前端弹窗统一取 data.message，这里把 message 提到顶层，
+            # 并把整个 dict 原样塞进 data。
+            message = detail.get("message") or detail.get("detail") or "请求失败"
             data: Any = detail
+        elif isinstance(detail, list):
+            message = "请求失败"
+            data = detail
         else:
             message = str(detail) if detail is not None else "请求失败"
             data = None

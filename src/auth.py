@@ -26,6 +26,7 @@ from sqlalchemy import Engine, and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from mp_agent.dao._helpers import dt_to_unix, unix_to_dt, utc_now
+from mp_agent.dao._engine_normalize import normalize_store_engine
 from mp_agent.dao.models import RefreshToken, User
 from mp_agent.dao.redis_client import (
     RateLimitExceeded,
@@ -112,7 +113,7 @@ class AuthService:
         if not _USERNAME_RE.match(admin_username):
             raise ValueError("ADMIN_USERNAME 须为 3–32 位字母、数字或下划线")
 
-        self._engine = engine or sync_engine
+        self._engine = normalize_store_engine(engine)
         self._jwt_secret = jwt_secret
         self._access_ttl = max(60, access_ttl)
         self._refresh_ttl = max(60, refresh_ttl)
@@ -296,11 +297,21 @@ class AuthService:
                     resolved_user = username or rt.username
                     session.delete(rt)
                     session.commit()
-                    revoke_all_access_for_user(resolved_user, ttl_seconds=self._access_ttl)
+                    # 登出 = 用户明确退出，不需要给新 token 留 1s 余量
+                    # (用户要重新登录才能拿到新 token)，所以 margin=0 最严格
+                    revoke_all_access_for_user(
+                        resolved_user,
+                        ttl_seconds=self._access_ttl,
+                        now_margin_seconds=0,
+                    )
                     return True
         # Fallback: refresh token was empty / not found, still try user-wide revoke
         if username:
-            revoke_all_access_for_user(username, ttl_seconds=self._access_ttl)
+            revoke_all_access_for_user(
+                username,
+                ttl_seconds=self._access_ttl,
+                now_margin_seconds=0,
+            )
         if access_jti and access_remaining_ttl:
             from mp_agent.dao.redis_client import blacklist_access_jti
             blacklist_access_jti(access_jti, ttl_seconds=access_remaining_ttl)
@@ -344,11 +355,16 @@ class AuthService:
                 status_code=401,
                 detail="access_token 已被吊销",
             )
-        # (b) 用户级 "iat < revoke_before" 粗粒度拉黑
+        # (b) 用户级 "iat <= revoke_before" 粗粒度拉黑
+        # marker = now-1（见 redis_client.revoke_all_access_for_user），语义：
+        #   「marker 时间戳及之前签发的 token 全部作废」
+        # -1s 安全余量保证：改密/禁用后立刻用新密码登录拿到的新 token（iat = now）
+        # 不会 <= now-1，不会被自己触发的 marker 误杀。
+        # 同时 TTL = access_ttl 保证所有真实在飞老 token 一定在 marker 窗口内。
         revoke_before = get_user_revoke_before(sub)
         if revoke_before:
             iat = int(payload.get("iat") or 0)
-            if iat and iat < revoke_before:
+            if iat and iat <= revoke_before:
                 raise HTTPException(
                     status_code=401,
                     detail="access_token 已被吊销（用户级吊销）",
@@ -491,8 +507,14 @@ class AuthService:
             db_user.password_hash = new_hash
 
             need_revoke = False
-            if not new_enabled or password is not None:
+            revoke_margin = 0
+            if not new_enabled:
                 need_revoke = True
+                revoke_margin = 0  # 禁用用户 = 激进吊销（包括这一秒内所有 token）
+            if password is not None:
+                need_revoke = True
+                revoke_margin = max(revoke_margin, 1)  # 改密后要留 1s 余量给新密码登录拿的新 token
+            if need_revoke:
                 rts = session.execute(
                     select(RefreshToken).where(RefreshToken.username == user)
                 ).scalars().all()
@@ -503,7 +525,11 @@ class AuthService:
 
             # 改密 / 禁用 → 立刻拉黑该用户所有现存 access token
             if need_revoke:
-                revoke_all_access_for_user(user, ttl_seconds=self._access_ttl)
+                revoke_all_access_for_user(
+                    user,
+                    ttl_seconds=self._access_ttl,
+                    now_margin_seconds=revoke_margin,
+                )
 
             updated = session.get(User, user)
             assert updated is not None
@@ -528,9 +554,18 @@ class AuthService:
             for rt in rts:
                 session.delete(rt)
             session.commit()
-        # 重置密码 → 用户级 access 全拉黑
-        revoke_all_access_for_user(user, ttl_seconds=self._access_ttl)
-        return _user_to_row(db_user)
+            # 必须在 session 关闭之前把所有 ORM 属性读出来（做成 dataclass），
+            # 否则 session 关了再访问 db_user.username 会抛 DetachedInstanceError。
+            refreshed = session.get(User, user)
+            assert refreshed is not None
+            row = _user_to_row(refreshed)
+        # 重置密码 → 用户级 access 全拉黑（留 1s 余量给新密码登录用的新 token）
+        revoke_all_access_for_user(
+            user,
+            ttl_seconds=self._access_ttl,
+            now_margin_seconds=1,
+        )
+        return row
 
     # ------------------------------------------------------------------
     # Internals

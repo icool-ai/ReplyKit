@@ -16,6 +16,7 @@ from sqlalchemy import Engine, func, select, text
 from sqlalchemy.orm import Session
 
 from mp_agent.dao._helpers import dt_to_unix, unix_to_dt, utc_now
+from mp_agent.dao._engine_normalize import normalize_store_engine
 from mp_agent.dao.models import ChatLog
 from mp_agent.dao.sync_db import sync_engine
 from src.chatbot import ChatResult
@@ -87,7 +88,7 @@ class ChatLogStore:
     """Append-only store for one Q&A turn per row (SQLAlchemy)."""
 
     def __init__(self, engine: Engine | None = None) -> None:
-        self._engine = engine or sync_engine
+        self._engine = normalize_store_engine(engine)
 
     def insert(
         self,
