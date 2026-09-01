@@ -385,15 +385,17 @@ class FaqStore:
 
 
 def load_faq_entries_from_path(path: Path) -> list[dict[str, Any]]:
+    from src.config import get_settings
     from src.faq_import import parse_faq_path
 
-    return parse_faq_path(path)
+    return parse_faq_path(path, settings=get_settings())
 
 
 def load_faq_entries_from_url(url: str) -> list[dict[str, Any]]:
+    from src.config import get_settings
     from src.faq_import import parse_faq_url
 
-    return parse_faq_url(url)
+    return parse_faq_url(url, settings=get_settings())
 
 
 def resolve_import_path(path: str) -> Path:
