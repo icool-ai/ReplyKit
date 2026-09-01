@@ -14,6 +14,7 @@ from base64 import b64decode
 from typing import Any
 
 from Crypto.Cipher import AES
+from mp_agent.dao.redis_client import cred_delete, cred_get, cred_setex
 
 from src.channel_store import ChannelConfigRow
 
@@ -24,8 +25,11 @@ SESSION_PREFIX = "feishu:"
 
 _seen_message_ids: dict[str, float] = {}
 _seen_lock = threading.Lock()
-_token_cache: dict[str, tuple[str, float]] = {}
+
+# tenant_access_token 缓存（优雅降级：Redis 不可用时退内存 dict）
 _token_lock = threading.Lock()
+_token_cache_fallback: dict[str, tuple[str, float]] = {}
+_TENANT_TOKEN_CATEGORY = "feishu_tenant"
 
 
 class FeishuCryptoError(Exception):
@@ -209,23 +213,70 @@ def verify_app_credentials(app_id: str, app_secret: str) -> None:
 
 
 def tenant_access_token(app_id: str, app_secret: str) -> str:
-    cache_key = f"{app_id}:{app_secret}"
+    """获取 tenant_access_token，优先 Redis 共享缓存，Redis 不可用时退内存 dict。
+
+    设计要点：
+    * Redis 路径：identity 用 app_id 单独做 key（app_secret 只用来请求飞书，不参与缓存 key）
+    * 并发刷新竞争：用 SET NX 拿一个短锁（30s），拿到锁的实例才去请求飞书 API，避免并发打飞书
+    * 优雅降级：Redis 挂了，回落到实例内 dict（单实例正常，多实例可能各拿一份，但不会出错）
+    """
+    aid = app_id.strip()
+    secret = app_secret.strip()
+    if not aid or not secret:
+        raise ValueError("App ID 与 App Secret 不能为空")
+    now = time.time()
+    # 1. Redis 缓存命中直接返回
+    cached = cred_get(_TENANT_TOKEN_CATEGORY, aid)
+    if cached:
+        return cached
+    # 2. 内存降级缓存命中直接返回（Redis 未命中时的兜底）
     with _token_lock:
-        cached = _token_cache.get(cache_key)
-        if cached and time.time() < cached[1]:
-            return cached[0]
-    data = http_json(
-        "POST",
-        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        body={"app_id": app_id, "app_secret": app_secret},
-    )
+        mem_cached = _token_cache_fallback.get(aid)
+        if mem_cached and now < mem_cached[1]:
+            return mem_cached[0]
+    # 3. 缓存未命中 → 请求飞书
+    #    用 SET NX 拿一个 "正在刷新" 短锁，避免多实例并发同时打飞书
+    refresh_lock_key = f"__refreshing__:{aid}"
+    lock_owner = cred_setex(_TENANT_TOKEN_CATEGORY, refresh_lock_key, "1", 30, nx=True)
+    try:
+        data = http_json(
+            "POST",
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            body={"app_id": aid, "app_secret": secret},
+        )
+    except Exception:
+        # 请求失败：没拿到锁的那个实例，等 1s 再试一次读缓存（可能拿到锁的实例已经写了）
+        if not lock_owner:
+            time.sleep(1.0)
+            cached2 = cred_get(_TENANT_TOKEN_CATEGORY, aid)
+            if cached2:
+                return cached2
+            with _token_lock:
+                mem_cached2 = _token_cache_fallback.get(aid)
+                if mem_cached2 and time.time() < mem_cached2[1]:
+                    return mem_cached2[0]
+        raise
     if data.get("code") != 0:
+        # 旧缓存失效时调用方可能需要主动删 key，cred_delete 放在业务层处理
         raise RuntimeError(f"获取 tenant_access_token 失败: {data}")
     token = str(data["tenant_access_token"])
-    expires = time.time() + int(data.get("expire", 7200)) - 120
+    ttl_seconds = max(60, int(data.get("expire", 7200)) - 120)
+    expires = now + ttl_seconds
+    # 4. 写 Redis 缓存 + 写内存降级缓存
+    cred_setex(_TENANT_TOKEN_CATEGORY, aid, token, ttl_seconds)
     with _token_lock:
-        _token_cache[cache_key] = (token, expires)
+        _token_cache_fallback[aid] = (token, expires)
     return token
+
+
+def invalidate_tenant_access_token(app_id: str) -> None:
+    """飞书返回 invalid token 错误时主动清缓存，下次调用会重新获取。"""
+    aid = app_id.strip()
+    if not aid:
+        return
+    cred_delete(_TENANT_TOKEN_CATEGORY, aid)
+    with _token_lock:
+        _token_cache_fallback.pop(aid, None)
 
 
 def reply_text(

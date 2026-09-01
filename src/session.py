@@ -1,9 +1,20 @@
-"""Session store: chat history + bot session snapshot, owned by username (SQLAlchemy)."""
+"""Session store: chat history + bot session snapshot, owned by username (SQLAlchemy).
+
+Layers (从外到内):
+  CachedSessionStore  →  Redis 热数据缓存 (Write-Through + TTL 冷热淘汰 + 双路穿透, 场景 3)
+       ↓ (装饰/包裹)
+  SqliteSessionStore  →  SQLite (Source of Truth, 持久化层)
+       ↓
+  SQLAlchemy ORM → chat_sessions 表
+"""
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
 from sqlalchemy import Engine, and_, func, select
@@ -12,7 +23,16 @@ from sqlalchemy.orm import Session
 from mp_agent.dao._helpers import dt_to_unix, utc_now
 from mp_agent.dao._engine_normalize import normalize_store_engine
 from mp_agent.dao.models import ChatSession
+from mp_agent.dao.redis_client import (
+    session_cache_get,
+    session_cache_invalidate,
+    session_cache_put,
+)
 from mp_agent.dao.sync_db import sync_engine
+
+_logger = logging.getLogger(__name__)
+
+_SESSION_CACHE_TTL = int(os.getenv("SESSION_CACHE_TTL", "1800"))
 
 
 @dataclass
@@ -367,4 +387,188 @@ class SqliteSessionStore:
             return True
 
     def close(self) -> None:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# CachedSessionStore: Write-Through + TTL 冷热淘汰 + 双路穿透 装饰器
+#
+# 这是场景 3 的核心实现。装饰任意实现了 SessionStore Protocol 的底层存储
+# (SqliteSessionStore / InMemorySessionStore)，在外层叠加热数据缓存层。
+#
+# 设计哲学：
+#   * DB 永远是 Source of Truth —— Cached 层 NEVER 跳过对 inner store 的调用
+#   * Redis 是 Look-Aside 纯加速层 —— 故障/淘汰/清空 都不影响正确性
+#   * 所有方法都与 Protocol 完全一致 —— 对 api.py 调用方是透明 Drop-In 替换
+# ---------------------------------------------------------------------------
+
+
+def _serialize_session_data(data: SessionData) -> str:
+    """把 SessionData 序列化为 JSON 字符串 (存入 Redis)。"""
+    return json.dumps(asdict(data), ensure_ascii=False)
+
+
+def _deserialize_session_data(raw: str) -> SessionData | None:
+    """从 Redis 的 JSON 字符串还原 SessionData；格式错误返回 None (触发回源 DB)。"""
+    try:
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return None
+        history = _parse_history(obj.get("history") or [])
+        bot_state = _parse_bot_state(obj.get("bot_state") or {})
+        return SessionData(
+            history=history,
+            bot_state=bot_state,
+            username=obj.get("username"),
+            title=str(obj.get("title") or ""),
+            created_at=int(obj.get("created_at") or 0),
+            updated_at=int(obj.get("updated_at") or 0),
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        _logger.warning("session cache deserialize failed, treating as miss")
+        return None
+
+
+class CachedSessionStore:
+    """ChatSession 热数据缓存层 —— 装饰任意 SessionStore 实现。
+
+    三条路径 (与场景 2 Cache-Aside 形成对比):
+    1. **读穿透 Read-Through**  (get / get_for_user):
+        Redis HIT  → 返回并刷新 TTL (滑动窗口保热)
+        Redis MISS → 查 inner store → 结果写入 Redis → 返回
+    2. **写穿透 Write-Through** (save):
+        先 inner store.save() (必须成功，Source of Truth)
+        再 session_cache_put() 把相同数据写入 Redis
+    3. **失效 Invalidate**      (clear / delete_for_user):
+        先 inner store 删除
+        再 session_cache_invalidate() 从 Redis 清掉对应 key
+
+    list_for_user 刻意不走缓存：它是摘要列表 (title/preview only，
+    体积小且每次 save 都会让列表变陈旧，缓存失效复杂得不偿失；
+    DB 已有 idx_chat_session_user_updated 复合索引优化，直接查更快。
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        self._inner = inner
+        self._ttl = ttl_seconds if ttl_seconds is not None else _SESSION_CACHE_TTL
+
+    # ------------------------------------------------------------------ get
+
+    def get(self, session_id: str) -> SessionData:
+        key = _normalize_session_id(session_id)
+
+        raw = session_cache_get(key, ttl_seconds=self._ttl)
+        if raw is not None:
+            cached = _deserialize_session_data(raw)
+            if cached is not None:
+                return cached
+
+        data = self._inner.get(key)
+
+        if self._ttl > 0:
+            try:
+                session_cache_put(
+                    key,
+                    _serialize_session_data(data),
+                    ttl_seconds=self._ttl,
+                )
+            except Exception:
+                pass
+
+        return data
+
+    # ----------------------------------------------------------------- save
+
+    def save(
+        self,
+        session_id: str,
+        *,
+        history: list[dict[str, str]],
+        bot_state: dict[str, Any],
+        username: str | None = None,
+        title: str | None = None,
+    ) -> None:
+        key = _normalize_session_id(session_id)
+
+        self._inner.save(
+            key,
+            history=history,
+            bot_state=bot_state,
+            username=username,
+            title=title,
+        )
+
+        if self._ttl <= 0:
+            return
+
+        fresh = self._inner.get(key)
+        try:
+            session_cache_put(
+                key,
+                _serialize_session_data(fresh),
+                ttl_seconds=self._ttl,
+            )
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------- clear
+
+    def clear(self, session_id: str) -> None:
+        key = _normalize_session_id(session_id)
+        self._inner.clear(key)
+        session_cache_invalidate(key)
+
+    # --------------------------------------------------------- list/summary
+
+    def list_for_user(
+        self, username: str, *, page: int = 1, page_size: int = 20
+    ) -> SessionPage:
+        return self._inner.list_for_user(username, page=page, page_size=page_size)
+
+    # --------------------------------------------------------- get_for_user
+
+    def get_for_user(self, session_id: str, username: str) -> SessionData | None:
+        key = _normalize_session_id(session_id)
+        user = (username or "").strip()
+
+        raw = session_cache_get(key, ttl_seconds=self._ttl)
+        if raw is not None:
+            cached = _deserialize_session_data(raw)
+            if cached is not None:
+                if cached.username != user:
+                    return None
+                return cached
+
+        data = self._inner.get_for_user(key, user)
+        if data is not None and self._ttl > 0:
+            try:
+                session_cache_put(
+                    key,
+                    _serialize_session_data(data),
+                    ttl_seconds=self._ttl,
+                )
+            except Exception:
+                pass
+        return data
+
+    # ------------------------------------------------------ delete_for_user
+
+    def delete_for_user(self, session_id: str, username: str) -> bool:
+        key = _normalize_session_id(session_id)
+        ok_del = self._inner.delete_for_user(key, username)
+        if ok_del:
+            session_cache_invalidate(key)
+        return ok_del
+
+    # -------------------------------------------------------------- passthru
+
+    def close(self) -> None:
+        closer = getattr(self._inner, "close", None)
+        if callable(closer):
+            return closer()
         return None

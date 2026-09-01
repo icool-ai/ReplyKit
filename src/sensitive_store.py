@@ -1,8 +1,9 @@
-"""Sensitive-word store (P3-4): SQLAlchemy CRUD + txt/json import + in-memory cache."""
+"""Sensitive-word store (P3-4): SQLAlchemy CRUD + txt/json import + in-memory + Redis cache."""
 
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from functools import lru_cache
@@ -18,8 +19,15 @@ from sqlalchemy.orm import Session
 from mp_agent.dao._helpers import dt_to_unix, utc_now
 from mp_agent.dao._engine_normalize import normalize_store_engine
 from mp_agent.dao.models import SensitiveWord
+from mp_agent.dao.redis_client import cache_delete, cache_get, cache_setex
 from mp_agent.dao.sync_db import sync_engine
 from src.config import PROJECT_ROOT
+
+_logger = logging.getLogger(__name__)
+
+_SENSITIVE_PATTERNS_CACHE_KEY = "cache:sensitive:patterns:v1"
+_SENSITIVE_CACHE_TTL_SEC = 600
+_SENSITIVE_LOCAL_SOFT_TTL_SEC = 30
 
 
 @dataclass(frozen=True)
@@ -83,18 +91,26 @@ def _row_to_sensitive(word: SensitiveWord) -> SensitiveRow:
 
 
 class SensitiveStore:
-    """SQLAlchemy store for sensitive-word patterns with a hot-reloadable cache."""
+    """SQLAlchemy store for sensitive-word patterns with 2-layer (L1 memory + L2 Redis) cache."""
 
     def __init__(self, engine: Engine | None = None) -> None:
         self._engine = normalize_store_engine(engine)
         self._patterns: tuple[str, ...] = ()
+        self._patterns_updated_at: float = 0.0
         self.reload_cache()
 
     def close(self) -> None:
         pass
 
+    def _is_local_cache_fresh(self) -> bool:
+        if not self._patterns:
+            return False
+        age = __import__("time").time() - self._patterns_updated_at
+        return 0 <= age <= _SENSITIVE_LOCAL_SOFT_TTL_SEC
+
     def reload_cache(self) -> tuple[str, ...]:
-        """Reload enabled patterns into memory (call after writes)."""
+        """Reload enabled patterns from DB -> refresh L1 memory + write to Redis L2."""
+        import time as _time
         with Session(self._engine) as session:
             rows = session.execute(
                 select(SensitiveWord)
@@ -104,10 +120,39 @@ class SensitiveStore:
             self._patterns = tuple(
                 str(w.pattern) for w in rows.scalars() if w.pattern
             )
+        self._patterns_updated_at = _time.time()
+        try:
+            cache_setex(
+                _SENSITIVE_PATTERNS_CACHE_KEY,
+                _SENSITIVE_CACHE_TTL_SEC,
+                json.dumps(list(self._patterns), ensure_ascii=False),
+            )
+        except Exception as exc:
+            _logger.warning("写 Redis 敏感词缓存失败（忽略，继续用本地内存）: %s", exc)
         return self._patterns
 
     def enabled_patterns(self) -> tuple[str, ...]:
-        return self._patterns
+        """Get enabled sensitive patterns: fresh L1 -> Redis -> DB fallback."""
+        import time as _time
+        if self._is_local_cache_fresh():
+            return self._patterns
+        raw = cache_get(_SENSITIVE_PATTERNS_CACHE_KEY)
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    self._patterns = tuple(str(p) for p in parsed if p)
+                    self._patterns_updated_at = _time.time()
+                    return self._patterns
+            except Exception as exc:
+                _logger.warning("解析 Redis 敏感词缓存失败，回源 DB: %s", exc)
+        return self.reload_cache()
+
+    def _invalidate_cache(self) -> None:
+        """Invalidate both Redis key and local L1 cache after writes."""
+        self._patterns = ()
+        self._patterns_updated_at = 0.0
+        cache_delete(_SENSITIVE_PATTERNS_CACHE_KEY)
 
     def get(self, word_id: str) -> SensitiveRow | None:
         word_id = (word_id or "").strip()
@@ -197,7 +242,7 @@ class SensitiveStore:
             )
             session.commit()
 
-        self.reload_cache()
+        self._invalidate_cache()
         row = self.get(new_id)
         assert row is not None
         return row
@@ -246,7 +291,7 @@ class SensitiveStore:
             word.updated_at = utc_now()
             session.commit()
 
-        self.reload_cache()
+        self._invalidate_cache()
         row = self.get(word_id)
         assert row is not None
         return row
@@ -273,7 +318,7 @@ class SensitiveStore:
             session.commit()
 
         if deleted:
-            self.reload_cache()
+            self._invalidate_cache()
         return deleted
 
     def import_patterns(

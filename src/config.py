@@ -71,11 +71,12 @@ class Settings:
     wecom_aes_key: str
     wecom_session_prefix: str
     wecom_unsupported_msg_reply: str
-    # --- Redis (optional: JWT blacklist + login rate limit) ---
+    # --- Redis (optional: JWT blacklist + login rate limit + ChatSession hot cache) ---
     redis_enabled: bool
     redis_url: str
     login_rate_limit: int
     login_rate_window_sec: int
+    session_cache_ttl: int
 
     @property
     def score_threshold(self) -> float:
@@ -252,6 +253,7 @@ class Settings:
             redis_url=os.getenv("REDIS_URL", os.getenv("MP_AGENT_REDIS_URL", "")).strip(),
             login_rate_limit=int(os.getenv("LOGIN_RATE_LIMIT", "5")),
             login_rate_window_sec=int(os.getenv("LOGIN_RATE_WINDOW_SEC", "300")),
+            session_cache_ttl=int(os.getenv("SESSION_CACHE_TTL", "1800")),
         )
 
 

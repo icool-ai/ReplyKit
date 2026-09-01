@@ -308,3 +308,277 @@ def login_rate_limit_reset(*, ip: str, username: str) -> None:
             r.delete(key)
         except Exception as exc:
             _logger.warning("Redis rate-limit reset failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# High-level helpers: Generic KV cache (场景 2/3 通用)
+# ---------------------------------------------------------------------------
+
+def cache_get(key: str) -> str | None:
+    """Fetch a cached string from Redis. Returns None on miss / unavailable."""
+    if not key:
+        return None
+    with get_redis() as r:
+        if r is None:
+            return None
+        try:
+            return r.get(key)
+        except Exception as exc:
+            _logger.warning("Redis cache_get %s failed: %s", key, exc)
+            return None
+
+
+def cache_setex(key: str, ttl_seconds: int, value: str) -> bool:
+    """Write a string to Redis with TTL. Returns True on success."""
+    if not key or ttl_seconds <= 0 or value is None:
+        return False
+    with get_redis() as r:
+        if r is None:
+            return False
+        try:
+            r.setex(key, ttl_seconds, value)
+            return True
+        except Exception as exc:
+            _logger.warning("Redis cache_setex %s failed: %s", key, exc)
+            return False
+
+
+def cache_delete(*keys: str) -> int:
+    """Delete one or more cache keys. Returns number of keys removed."""
+    cleaned = [k for k in keys if k]
+    if not cleaned:
+        return 0
+    with get_redis() as r:
+        if r is None:
+            return 0
+        try:
+            return int(r.delete(*cleaned) or 0)
+        except Exception as exc:
+            _logger.warning("Redis cache_delete %s failed: %s", cleaned, exc)
+            return 0
+
+
+# ---------------------------------------------------------------------------
+# High-level helpers: ChatSession 热数据缓存 (场景 3)
+#
+# 建模模式：Write-Through 写穿透 + TTL 冷热淘汰 + get/save 双路穿透
+# 场景特征：读写都高频 + 每条数据大 (history 几十到几百条消息) + 明显冷热分层
+#           (活跃用户最近会话是热数据，超过 30min 没人访问的会话自动冷出)
+#
+# Key:   cache:session:{session_id}  (String → JSON payload)
+# TTL:   SESSION_CACHE_TTL_SEC (default 1800s = 30min)
+#        → 30min 内无任何 get/save 访问，Redis 自动淘汰，内存让位给热会话
+#        → 每次命中都 EXPIRE 刷新 TTL (滑动窗口)，持续访问的会话永不过期
+#
+# 一致性策略：
+#   * SQLite 是单一 Source of Truth，Redis 纯为 Look-Aside 加速层
+#   * Write-Through: save() 路径先写 DB，再同步写 Redis，同请求周期完成
+#   * 读穿透 (Read-Through): get() 未命中时，从 DB 回填 Redis
+#   * Redis 故障/淘汰: 下次 get() 透明从 DB 重建，无数据丢失风险
+# ---------------------------------------------------------------------------
+
+_SESSION_CACHE_KEY_PREFIX = "cache:session:"
+_SESSION_CACHE_TTL_DEFAULT = 1800
+
+
+def _session_cache_key(session_id: str) -> str:
+    return f"{_SESSION_CACHE_KEY_PREFIX}{session_id}"
+
+
+def session_cache_get(
+    session_id: str,
+    *,
+    ttl_seconds: int = _SESSION_CACHE_TTL_DEFAULT,
+) -> str | None:
+    """读穿透 GET: 命中返回 JSON 字符串并刷新 TTL (滑动窗口保热); 未命中返回 None。
+
+    Redis 不可用时返回 None (调用方透明回退 DB，优雅降级)。
+    """
+    if not session_id:
+        return None
+    key = _session_cache_key(session_id)
+    with get_redis() as r:
+        if r is None:
+            return None
+        try:
+            val = r.get(key)
+            if val is None:
+                return None
+            if ttl_seconds > 0:
+                try:
+                    r.expire(key, ttl_seconds)
+                except Exception:
+                    pass
+            return val
+        except Exception as exc:
+            _logger.warning("Redis session_cache_get %s failed: %s", session_id, exc)
+            return None
+
+
+def session_cache_put(
+    session_id: str,
+    json_payload: str,
+    *,
+    ttl_seconds: int = _SESSION_CACHE_TTL_DEFAULT,
+) -> bool:
+    """写穿透 PUT: SETEX 写入 JSON + TTL。用于 save() 写穿透 和 get() 未命中回填。
+
+    返回 True 表示写入成功，False 表示 Redis 不可用或失败 (调用方无需处理)。
+    """
+    if not session_id or json_payload is None or ttl_seconds <= 0:
+        return False
+    key = _session_cache_key(session_id)
+    with get_redis() as r:
+        if r is None:
+            return False
+        try:
+            r.setex(key, ttl_seconds, json_payload)
+            return True
+        except Exception as exc:
+            _logger.warning("Redis session_cache_put %s failed: %s", session_id, exc)
+            return False
+
+
+def session_cache_invalidate(*session_ids: str) -> int:
+    """主动失效 (用于 delete / clear)。返回实际删除的 key 数。"""
+    keys = [_session_cache_key(sid) for sid in session_ids if sid]
+    return cache_delete(*keys)
+
+
+# ---------------------------------------------------------------------------
+# High-level helpers: 飞书 OAuth state (优先级 1)
+#
+# 场景特征：短时一次性票据，TTL=15min，多实例必须共享（否则多 worker 回调必失败）
+# 设计：SETNX + SETEX 保证唯一写入后 TTL，GET + DEL 原子消费（用 Lua 避免 race）
+# Key:   oauth:feishu:state:{state}  (String → JSON: {cid, open_id, exp})
+# ---------------------------------------------------------------------------
+
+_OAUTH_STATE_KEY_PREFIX = "oauth:feishu:state:"
+
+
+def oauth_state_put(state: str, config_id: str, open_id: str, ttl_seconds: int) -> bool:
+    """写入 OAuth state（带 TTL）。返回 True 成功，False 表示 Redis 不可用。"""
+    if not state or not config_id or not open_id or ttl_seconds <= 0:
+        return False
+    key = f"{_OAUTH_STATE_KEY_PREFIX}{state}"
+    import json as _json
+    payload = _json.dumps({"cid": config_id, "oid": open_id})
+    return cache_setex(key, ttl_seconds, payload)
+
+
+def oauth_state_consume(state: str) -> tuple[str, str] | None:
+    """一次性消费 OAuth state：返回 (config_id, open_id)，不存在/过期/Redis 不可用返回 None。
+
+    使用 Lua 脚本保证「GET + DEL」原子性，避免并发回调重复消费。
+    """
+    if not state:
+        return None
+    key = f"{_OAUTH_STATE_KEY_PREFIX}{state}"
+    with get_redis() as r:
+        if r is None:
+            return None
+        try:
+            lua = """
+                local val = redis.call("GET", KEYS[1])
+                if val then
+                    redis.call("DEL", KEYS[1])
+                end
+                return val
+            """
+            raw = r.eval(lua, 1, key)
+            if not raw:
+                return None
+            import json as _json
+            obj = _json.loads(raw)
+            return str(obj.get("cid") or ""), str(obj.get("oid") or "")
+        except Exception as exc:
+            _logger.warning("Redis oauth_state_consume %s failed: %s", state, exc)
+            return None
+
+
+# ---------------------------------------------------------------------------
+# High-level helpers: 飞书/外部短期凭据缓存 (优先级 2: tenant_access_token / jsapi_ticket)
+#
+# 场景特征：2h 左右 TTL，多实例共享避免重复请求外部 API 触达频控 + 节省配额
+# 设计：GET 命中直接返回；未命中由调用方请求外部 API 后 SETNX + SETEX
+#       （Redis 层提供 get/set 两个简单 helper，竞争安全由调用方用 SET NX 保证）
+# Key:   cred:{category}:{identity}  (String → credential payload)
+# ---------------------------------------------------------------------------
+
+_CRED_KEY_PREFIX = "cred:"
+
+
+def cred_get(category: str, identity: str) -> str | None:
+    """读取短期凭据缓存：未命中/Redis 不可用返回 None。"""
+    if not category or not identity:
+        return None
+    key = f"{_CRED_KEY_PREFIX}{category}:{identity}"
+    return cache_get(key)
+
+
+def cred_setex(
+    category: str, identity: str, value: str, ttl_seconds: int, *, nx: bool = False
+) -> bool:
+    """写入短期凭据缓存。
+
+    * ``nx=True``：仅当 key 不存在时写入（SET NX），避免并发刷新时互相覆盖。
+      典型用法：刷新 token 前 SETNX 抢锁，成功那个才去请求外部 API，然后再用普通 setex 写最终 token。
+    """
+    if not category or not identity or not value or ttl_seconds <= 0:
+        return False
+    key = f"{_CRED_KEY_PREFIX}{category}:{identity}"
+    if not nx:
+        return cache_setex(key, ttl_seconds, value)
+    with get_redis() as r:
+        if r is None:
+            return False
+        try:
+            ok = bool(r.set(key, value, nx=True, ex=ttl_seconds))
+            return ok
+        except Exception as exc:
+            _logger.warning("Redis cred_setex NX %s failed: %s", key, exc)
+            return False
+
+
+def cred_delete(category: str, identity: str) -> int:
+    """主动失效凭据（外部 API 返回 invalid token 时调用）。"""
+    if not category or not identity:
+        return 0
+    key = f"{_CRED_KEY_PREFIX}{category}:{identity}"
+    return cache_delete(key)
+
+
+# ---------------------------------------------------------------------------
+# High-level helpers: 飞书用户 access_token 读穿透缓存 (优先级 3)
+#
+# 场景特征：FeishuUserToken.access_token 2h 内有效，读极高频（每次飞书任务/查联系人前）
+#           但写极少（refresh 才写）。refresh_token 必须仍保留在 DB。
+# 设计：Look-Aside 读穿透，TTL 提前 2min 自然过期，强制刷新用 invalidate helper
+# Key:   cred:feishu_user_access:{config_id}:{open_id}  (String → access_token)
+# ---------------------------------------------------------------------------
+
+_FEISHU_USER_ACCESS_CATEGORY = "feishu_user_access"
+
+
+def feishu_user_access_cache_get(config_id: str, open_id: str) -> str | None:
+    """读穿透：命中返回 access_token；未命中/Redis 不可用返回 None（调用方查 DB 回填）。"""
+    return cred_get(_FEISHU_USER_ACCESS_CATEGORY, f"{config_id}:{open_id}")
+
+
+def feishu_user_access_cache_put(
+    config_id: str, open_id: str, access_token: str, ttl_seconds: int
+) -> bool:
+    """DB 查到 / refresh 成功后回填。TTL 请传入「expires_at - now - 120」（提前 2min 自然过期）。"""
+    if ttl_seconds <= 0:
+        return False
+    return cred_setex(
+        _FEISHU_USER_ACCESS_CATEGORY,
+        f"{config_id}:{open_id}",
+        access_token,
+        ttl_seconds,
+    )
+
+
+def feishu_user_access_cache_invalidate(config_id: str, open_id: str) -> int:
+    """refresh token 失败 / 用户换绑后主动失效。"""
+    return cred_delete(_FEISHU_USER_ACCESS_CATEGORY, f"{config_id}:{open_id}")
