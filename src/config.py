@@ -77,6 +77,10 @@ class Settings:
     login_rate_limit: int
     login_rate_window_sec: int
     session_cache_ttl: int
+    # --- Apache Tika (optional: universal document parser, graceful downgrade) ---
+    tika_enabled: bool
+    tika_url: str
+    tika_timeout_sec: int
 
     @property
     def score_threshold(self) -> float:
@@ -254,6 +258,13 @@ class Settings:
             login_rate_limit=int(os.getenv("LOGIN_RATE_LIMIT", "5")),
             login_rate_window_sec=int(os.getenv("LOGIN_RATE_WINDOW_SEC", "300")),
             session_cache_ttl=int(os.getenv("SESSION_CACHE_TTL", "1800")),
+            tika_enabled=os.getenv("TIKA_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes", "on"},
+            tika_url=os.getenv(
+                "TIKA_URL",
+                "http://127.0.0.1:9998/tika",
+            ).strip(),
+            tika_timeout_sec=int(os.getenv("TIKA_TIMEOUT_SEC", "60")),
         )
 
 

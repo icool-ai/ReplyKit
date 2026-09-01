@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import RLock
 
-from langchain_community.document_loaders import TextLoader
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -24,12 +23,23 @@ from qdrant_client.http.models import (
 )
 
 from src.config import Settings
-from src.docx_images import load_docx_with_images
 from src.faq_loader import faq_entry_to_documents
 from src.faq_store import FaqRow, FaqStore
+from src.tika_parser import extract_text_from_path
 
 CONTENT_KEY = "page_content"
-SUPPORTED_SUFFIXES = {".txt", ".md", ".docx"}
+# Tika 能覆盖的常见文档格式：office 全家桶 + PDF + 纯文本/网页
+# 注意：仍然建议先在 WSL2 Tika Server 端验证特殊格式兼容性
+SUPPORTED_SUFFIXES = {
+    ".txt", ".md", ".markdown",
+    ".docx", ".doc", ".rtf", ".odt",
+    ".pdf", ".epub",
+    ".xlsx", ".xls", ".csv", ".tsv", ".ods",
+    ".pptx", ".ppt", ".odp",
+    ".html", ".htm", ".xhtml", ".rss",
+    ".eml", ".msg",
+    ".json", ".xml",
+}
 FAQ_DB_SOURCE = "faq_db"
 _EMBED_BATCH_SIZE = 64
 _EMBED_MAX_WORKERS = 4
@@ -89,23 +99,17 @@ def _infer_doc_type(path: Path, settings: Settings) -> str:
             return "faq"
     except OSError:
         pass
-    if path.suffix.lower() == ".docx":
-        return "manual"
-    return "faq"
-
-
-def _load_docx(path: Path, settings: Settings) -> list[Document]:
-    settings.assets_dir.mkdir(parents=True, exist_ok=True)
-    return load_docx_with_images(path, settings.assets_dir)
+    return "manual"
 
 
 def _is_temp_office_file(path: Path) -> bool:
-    """Skip Word lock files like '~$操作说明.docx' created while the doc is open."""
+    """Skip Office lock files like '~$操作说明.docx' or '.~xxx.pptx'."""
     name = path.name
     return name.startswith("~$") or name.startswith(".~")
 
 
 def _load_file(path: Path, settings: Settings) -> list[Document]:
+    """所有文档统一通过 Apache Tika 抽取纯文本 → 单 Document。"""
     suffix = path.suffix.lower()
     if suffix not in SUPPORTED_SUFFIXES:
         return []
@@ -113,20 +117,22 @@ def _load_file(path: Path, settings: Settings) -> list[Document]:
         return []
 
     resolved = path.resolve()
-    if suffix == ".docx":
-        docs = _load_docx(resolved, settings)
-    else:
-        docs = TextLoader(str(resolved), encoding="utf-8").load()
+    text, meta = extract_text_from_path(resolved, settings)
+    if not text:
+        _logger.info("文档抽取结果为空，跳过（%s）", resolved)
+        return []
 
     doc_type = _infer_doc_type(resolved, settings)
-    for doc in docs:
-        metadata = dict(doc.metadata or {})
-        metadata["source"] = str(resolved)
-        metadata["doc_type"] = doc_type
-        if "images" not in metadata:
-            metadata["images"] = []
-        doc.metadata = metadata
-    return docs
+    metadata = dict(meta or {})
+    metadata["source"] = str(resolved)
+    metadata["doc_type"] = doc_type
+    metadata["images"] = []
+    content_type = meta.get("Content-Type")
+    if content_type:
+        metadata["tika_content_type"] = (
+            content_type[0] if isinstance(content_type, list) else content_type
+        )
+    return [Document(page_content=text, metadata=metadata)]
 
 
 def _faq_store(settings: Settings) -> FaqStore:
@@ -241,25 +247,6 @@ def _indexed_source_names(settings: Settings) -> set[str]:
     return names
 
 
-def _any_chunk_has_images(settings: Settings) -> bool:
-    client = _get_qdrant_client(settings)
-    if not _collection_exists(client, settings.collection_name):
-        return False
-    points, _ = client.scroll(
-        collection_name=settings.collection_name,
-        limit=50,
-        with_payload=True,
-        with_vectors=False,
-    )
-    for point in points:
-        images = (point.payload or {}).get("images")
-        if isinstance(images, list) and images:
-            return True
-        if isinstance(images, str) and images.strip():
-            return True
-    return False
-
-
 def _any_chunk_has_faq_id(settings: Settings) -> bool:
     client = _get_qdrant_client(settings)
     if not _collection_exists(client, settings.collection_name):
@@ -306,10 +293,6 @@ def knowledge_needs_rebuild(settings: Settings) -> bool:
         return True
     indexed = _indexed_source_names(settings)
     if disk_names and not disk_names.issubset(indexed):
-        return True
-    # Old indexes without image binding need a one-time rebuild for docx manuals.
-    has_docx = any(path.suffix.lower() == ".docx" for path in disk_files)
-    if has_docx and not _any_chunk_has_images(settings):
         return True
     if has_enabled_faq and not _any_chunk_has_faq_id(settings):
         return True

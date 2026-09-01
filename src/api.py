@@ -91,6 +91,7 @@ from src.dify_retrieval import (
 from src.skills.base import ChannelContext
 from src.faq_import import (
     SUPPORTED_FORMATS,
+    TEMPLATE_FORMATS,
     build_template_file,
     detect_format,
     list_template_meta,
@@ -1888,7 +1889,10 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/faqs/import-file", response_model=ApiResponse[FaqImportData])
     async def faq_import_file(
-        file: UploadFile = File(..., description="FAQ 文件（json/csv/txt/xls/xlsx）"),
+        file: UploadFile = File(
+            ...,
+            description="FAQ 文件（json/csv/txt/xls/xlsx/pdf/doc/docx/... 均可，Tika 统一解析）",
+        ),
         _: dict[str, Any] = Depends(require_ops),
     ) -> dict[str, Any]:
         filename = (file.filename or "").strip()
@@ -1897,21 +1901,27 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "无法识别文件格式，请上传："
-                    ".json / .csv / .txt / .xls / .xlsx"
+                    "无法识别文件格式。Tika 可识别："
+                    ".json / .csv / .txt / .xls / .xlsx / .pdf / .doc / .docx"
+                    " / .rtf / .ppt / .pptx / .md / .html 等"
                 ),
             )
         raw = await file.read()
         if not raw:
             raise HTTPException(status_code=422, detail="上传文件为空")
         try:
-            entries = parse_faq_bytes(raw, fmt)
+            entries = parse_faq_bytes(
+                raw, fmt, filename_hint=filename, settings=settings,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not entries:
             raise HTTPException(
                 status_code=422,
-                detail="文件中没有有效的 FAQ（需含 question/answer 或 Q:/A:）",
+                detail=(
+                    "文件中未匹配到有效 FAQ。请确保内容包含 Q:/A: 或 问:/答: 前缀"
+                    "（Tika 先抽取纯文本，再按前缀规则识别每条 FAQ）。"
+                ),
             )
         return _faq_import_entries(entries)
 
@@ -2003,10 +2013,10 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
         fmt = (template_format or "").strip().lower()
         if fmt == "text":
             fmt = "txt"
-        if fmt not in SUPPORTED_FORMATS:
+        if fmt not in TEMPLATE_FORMATS:
             raise HTTPException(
                 status_code=422,
-                detail=f"format 须为：{', '.join(SUPPORTED_FORMATS)}",
+                detail=f"format 须为：{', '.join(TEMPLATE_FORMATS)}（仅下载模板用；解析侧支持更多后缀）",
             )
         try:
             content, filename, media_type = build_template_file(fmt)

@@ -1,4 +1,12 @@
-"""FAQ import parsers + downloadable templates (json/csv/txt/xls/xlsx)."""
+"""FAQ import (Tika unified text extraction + Q/A/S/C rule matching) + downloadable templates.
+
+解析侧改造说明：
+  * 所有格式（json/csv/txt/xls/xlsx/pdf/doc/docx/...）**统一**先经 Apache Tika 抽取纯文本；
+  * 再按 ``_parse_text_content`` 中的 ``Q:/A:/S:/C:`` 规则匹配 FAQ 条目；
+  * 不再依赖 ``json`` / ``csv.DictReader`` / ``openpyxl`` / ``xlrd`` 的专用结构化解析。
+模板生成侧保持不变：``_render_*`` 仍用 openpyxl / xlwt / csv / json 标准库生成下载模板，
+    这些是生成能力而非解析能力，与 Tika 并不冲突。
+"""
 
 from __future__ import annotations
 
@@ -11,6 +19,9 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+from src.config import Settings
+from src.tika_parser import extract_text_from_bytes
 
 # 表格模板使用的中文表头（CSV / Excel）；导入时由 _norm_header 映射回内部字段名
 TABLE_HEADERS_ZH: list[str] = ["编号", "分类", "标准问", "答案", "相似问"]
@@ -71,38 +82,46 @@ SAMPLE_ENTRIES: list[dict[str, Any]] = [
     },
 ]
 
-SUPPORTED_FORMATS = ("json", "csv", "txt", "xls", "xlsx")
+# 模板仍提供 5 种传统格式下载，但实际导入已通过 Tika 统一，以下后缀均可识别
+TEMPLATE_FORMATS = ("json", "csv", "txt", "xls", "xlsx")
+SUPPORTED_FORMATS = TEMPLATE_FORMATS + (
+    "pdf", "doc", "docx", "rtf", "odt",
+    "xlsx", "xls",
+    "pptx", "ppt", "odp",
+    "html", "htm", "eml", "md", "markdown",
+)
+SUPPORTED_FORMATS = tuple(dict.fromkeys(SUPPORTED_FORMATS))  # 去重保序
 
 _FORMAT_META: dict[str, dict[str, str]] = {
     "json": {
         "filename": "faq_template.json",
         "description": (
-            "JSON：含「字段说明」与 faqs 数组；"
-            "question/answer（或标准问/答案）必填"
+            "JSON 模板（下载后请按 Q:/A: 规则填内容）；"
+            "导入时由 Apache Tika 抽取纯文本后按 Q/A/S/C 规则识别 FAQ"
         ),
         "media_type": "application/json; charset=utf-8",
     },
     "csv": {
         "filename": "faq_template.csv",
         "description": (
-            "CSV 中文表头：编号/分类/标准问/答案/相似问；"
-            "相似问用 | 分隔"
+            "CSV 模板（下载后按 Q:/A: 填内容）；"
+            "导入时由 Apache Tika 抽取纯文本后统一识别"
         ),
         "media_type": "text/csv; charset=utf-8",
     },
     "txt": {
         "filename": "faq_template.txt",
-        "description": "文本模板：Q:/A: 必填，S: 相似问，C: 分类",
+        "description": "文本模板：Q:/A: 必填，S: 相似问，C: 分类；条目间用 --- 分隔",
         "media_type": "text/plain; charset=utf-8",
     },
     "xls": {
         "filename": "faq_template.xls",
-        "description": "Excel 97-2003：中文表头 +「字段说明」工作表",
+        "description": "Excel 97-2003 模板（下载后单元格内填 Q:/A: 内容）",
         "media_type": "application/vnd.ms-excel",
     },
     "xlsx": {
         "filename": "faq_template.xlsx",
-        "description": "Excel：中文表头 +「字段说明」工作表",
+        "description": "Excel 模板（单元格内填 Q:/A:，导入由 Tika 统一识别）",
         "media_type": (
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         ),
@@ -110,12 +129,27 @@ _FORMAT_META: dict[str, dict[str, str]] = {
 }
 
 _SUFFIX_MAP = {
+    # 原有 5 种
     ".json": "json",
     ".csv": "csv",
     ".txt": "txt",
     ".text": "txt",
     ".xls": "xls",
     ".xlsx": "xlsx",
+    # Tika 兜底新增：只要后缀在这里，就会用 Tika 抽文本然后走 Q/A 规则匹配
+    ".pdf": "pdf",
+    ".doc": "doc",
+    ".docx": "docx",
+    ".rtf": "rtf",
+    ".odt": "odt",
+    ".ppt": "ppt",
+    ".pptx": "pptx",
+    ".odp": "odp",
+    ".html": "html",
+    ".htm": "htm",
+    ".md": "md",
+    ".markdown": "markdown",
+    ".eml": "eml",
 }
 
 _QA_PREFIX = re.compile(
@@ -131,7 +165,7 @@ def list_template_meta() -> list[dict[str, str]]:
             "filename": _FORMAT_META[fmt]["filename"],
             "description": _FORMAT_META[fmt]["description"],
         }
-        for fmt in SUPPORTED_FORMATS
+        for fmt in TEMPLATE_FORMATS
     ]
 
 
@@ -198,24 +232,55 @@ def _field_docs_json() -> list[dict[str, str]]:
     ]
 
 
-def parse_faq_bytes(data: bytes, fmt: str) -> list[dict[str, Any]]:
+def parse_faq_bytes(
+    data: bytes,
+    fmt: str,
+    *,
+    filename_hint: str = "",
+    settings: Settings | None = None,
+) -> list[dict[str, Any]]:
+    """**所有格式统一入口**：先用 Tika 抽纯文本，再按 Q/A/S/C 规则匹配 FAQ。
+
+    Args:
+      data: 上传文件字节
+      fmt: 由 ``detect_format(文件名)`` 返回的格式标识（仅作校验；实际解析不依赖它）
+      filename_hint: 原文件名，便于日志追踪
+      settings: Settings 实例，用于取 TIKA_URL/超时/开关。未传则用 Settings.from_env()
+
+    Returns:
+      归一化后的 FAQ list[dict]，每一条至少含 question/answer；
+      Tika 连不上 / 抽出来空 / 没有 Q/A 规则匹配 都会返回空列表，
+      由上层接口返回 422 提示用户。
+    """
     fmt = (fmt or "").strip().lower()
     if fmt not in SUPPORTED_FORMATS:
-        raise ValueError(f"不支持的格式：{fmt}，可选：{', '.join(SUPPORTED_FORMATS)}")
-    if fmt == "json":
-        return _parse_json(data)
-    if fmt == "csv":
-        return _parse_csv(data)
-    if fmt == "txt":
-        return _parse_txt(data)
-    if fmt == "xls":
-        return _parse_xls(data)
-    if fmt == "xlsx":
-        return _parse_xlsx(data)
-    raise ValueError(f"不支持的格式：{fmt}")
+        raise ValueError(
+            f"不支持的格式：{fmt}。可识别扩展名："
+            + " / ".join(sorted({f".{f}" for f in _SUFFIX_MAP.keys()}))
+        )
+    if not data:
+        return []
+    settings = settings or Settings.from_env()
+    text, _meta = extract_text_from_bytes(data, filename_hint, settings)
+    if not text:
+        # 降级兜底：UTF-8/GBK 强行 decode（防止用户传纯 txt 但 Tika 未启动）
+        for enc in ("utf-8-sig", "utf-8", "gbk"):
+            try:
+                text = data.decode(enc).strip()
+                if text:
+                    break
+            except UnicodeDecodeError:
+                continue
+    if not text:
+        return []
+    return _parse_text_content(text)
 
 
-def parse_faq_path(path: Path) -> list[dict[str, Any]]:
+def parse_faq_path(
+    path: Path,
+    *,
+    settings: Settings | None = None,
+) -> list[dict[str, Any]]:
     path = path.resolve()
     if not path.exists():
         raise FileNotFoundError(f"FAQ 文件不存在: {path}")
@@ -223,34 +288,25 @@ def parse_faq_path(path: Path) -> list[dict[str, Any]]:
     if not fmt:
         raise ValueError(
             f"无法识别文件格式：{path.name}。支持扩展名："
-            ".json / .csv / .txt / .text / .xls / .xlsx"
+            + " / ".join(sorted(_SUFFIX_MAP.keys()))
         )
-    return parse_faq_bytes(path.read_bytes(), fmt)
+    settings = settings or Settings.from_env()
+    data = path.read_bytes()
+    return parse_faq_bytes(data, fmt, filename_hint=path.name, settings=settings)
 
 
-def parse_faq_url(url: str) -> list[dict[str, Any]]:
+def parse_faq_url(
+    url: str,
+    *,
+    settings: Settings | None = None,
+) -> list[dict[str, Any]]:
     url = (url or "").strip()
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("url 仅支持 http:// 或 https://")
     if not parsed.netloc:
         raise ValueError("url 无效")
-
-    fmt = detect_format(parsed.path) or "json"
-    accept = {
-        "json": "application/json,text/plain,*/*",
-        "csv": "text/csv,text/plain,*/*",
-        "txt": "text/plain,*/*",
-        "xls": "application/vnd.ms-excel,*/*",
-        "xlsx": (
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*"
-        ),
-    }.get(fmt, "*/*")
-
-    req = Request(
-        url,
-        headers={"User-Agent": "replykit/0.1", "Accept": accept},
-    )
+    req = Request(url, headers={"User-Agent": "replykit/0.1", "Accept": "*/*"})
     try:
         with urlopen(req, timeout=30) as resp:
             body = resp.read()
@@ -258,15 +314,18 @@ def parse_faq_url(url: str) -> list[dict[str, Any]]:
         raise ValueError(f"拉取 FAQ URL 失败: HTTP {exc.code}") from exc
     except URLError as exc:
         raise ValueError(f"拉取 FAQ URL 失败: {exc.reason}") from exc
-
-    return parse_faq_bytes(body, fmt)
+    fmt = detect_format(parsed.path) or "txt"
+    settings = settings or Settings.from_env()
+    return parse_faq_bytes(body, fmt, filename_hint=parsed.path, settings=settings)
 
 
 def build_template_file(fmt: str) -> tuple[bytes, str, str]:
-    """Return (content, filename, media_type)."""
+    """Return (content, filename, media_type). 仅限 TEMPLATE_FORMATS。"""
     fmt = (fmt or "").strip().lower()
-    if fmt not in SUPPORTED_FORMATS:
-        raise ValueError(f"未知模板格式：{fmt}")
+    if fmt not in TEMPLATE_FORMATS:
+        raise ValueError(
+            f"未知模板格式：{fmt}，模板仅提供：{', '.join(TEMPLATE_FORMATS)}"
+        )
     meta = _FORMAT_META[fmt]
     if fmt == "json":
         content = _render_json(SAMPLE_ENTRIES)
@@ -281,85 +340,13 @@ def build_template_file(fmt: str) -> tuple[bytes, str, str]:
     return content, meta["filename"], meta["media_type"]
 
 
-def _parse_json(data: bytes) -> list[dict[str, Any]]:
-    text = data.decode("utf-8-sig")
-    raw = json.loads(text)
-    if isinstance(raw, dict):
-        # 兼容 {"faqs": [...]} / {"数据": [...]}，忽略「字段说明」等元信息键
-        for key in ("faqs", "数据", "items", "list"):
-            if isinstance(raw.get(key), list):
-                raw = raw[key]
-                break
-        else:
-            raise ValueError(
-                'FAQ JSON 须为数组，或包含 faqs 数组的对象，例如 '
-                '{"字段说明": {...}, "faqs": [...]}'
-            )
-    if not isinstance(raw, list):
-        raise ValueError("FAQ JSON 须为数组，或 {\"faqs\": [...]}")
-    return normalize_entries([x for x in raw if isinstance(x, dict)])
+def _parse_text_content(text: str) -> list[dict[str, Any]]:
+    """通用纯文本 FAQ 匹配：Q:/A:/S:/C: 前缀规则 + 分段分隔符。
 
-
-def _parse_csv(data: bytes) -> list[dict[str, Any]]:
-    text = data.decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(text))
-    if not reader.fieldnames:
-        raise ValueError("CSV 缺少表头")
-    rows: list[dict[str, Any]] = []
-    for row in reader:
-        if not row:
-            continue
-        mapped = {_norm_header(k): (v or "").strip() for k, v in row.items() if k}
-        rows.append(mapped)
-    return normalize_entries(rows)
-
-
-def _norm_header(name: str) -> str:
-    """中英文表头 / 字段名 → 内部英文字段名。"""
-    key = (name or "").strip()
-    key_l = key.lower()
-    aliases = {
-        # id
-        "id": "id",
-        "faq_id": "id",
-        "faqid": "id",
-        "编号": "id",
-        "标识": "id",
-        "唯一编号": "id",
-        # category
-        "category": "category",
-        "分类": "category",
-        "类别": "category",
-        # question
-        "question": "question",
-        "标准问": "question",
-        "问题": "question",
-        "问法": "question",
-        "主问题": "question",
-        "标题": "question",
-        # answer
-        "answer": "answer",
-        "答案": "answer",
-        "回答": "answer",
-        "回复": "answer",
-        "标准答案": "answer",
-        # similar
-        "similar": "similar",
-        "similars": "similar",
-        "相似问": "similar",
-        "相似问题": "similar",
-        "相似问法": "similar",
-        "同义问": "similar",
-    }
-    if key in aliases:
-        return aliases[key]
-    if key_l in aliases:
-        return aliases[key_l]
-    return key_l
-
-
-def _parse_txt(data: bytes) -> list[dict[str, Any]]:
-    text = data.decode("utf-8-sig")
+    Tika 抽出来的 PDF / Excel / DOCX 纯文本都会进入这里。
+    为兼容旧 Excel/JSON 中直接写作「标准问: xxx」「答案: yyy」的一行行内容，
+    同样支持中文关键字 + 冒号 前缀（见 _QA_PREFIX 正则）。
+    """
     entries: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     answer_lines: list[str] = []
@@ -380,14 +367,15 @@ def _parse_txt(data: bytes) -> list[dict[str, Any]]:
 
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
-        if line.strip() in {"---", "***", "===", ""}:
-            if line.strip() in {"---", "***", "==="}:
+        stripped = line.strip()
+        if stripped in {"---", "***", "===", ""}:
+            if stripped in {"---", "***", "==="}:
                 flush()
             elif mode == "A" and answer_lines:
                 answer_lines.append("")
             continue
 
-        m = _QA_PREFIX.match(line.strip())
+        m = _QA_PREFIX.match(stripped)
         if m:
             tag, rest = m.group(1), m.group(2)
             tag_l = tag.lower()
@@ -426,98 +414,11 @@ def _parse_txt(data: bytes) -> list[dict[str, Any]]:
 
         if mode == "A" and current is not None:
             answer_lines.append(line)
-        elif mode == "Q" and current is not None and line.strip():
-            # 续行并入标准问
-            current["question"] = f"{current.get('question', '')} {line.strip()}".strip()
+        elif mode == "Q" and current is not None and stripped:
+            current["question"] = f"{current.get('question', '')} {stripped}".strip()
 
     flush()
     return entries
-
-
-def _parse_table_rows(headers: list[str], rows: list[list[Any]]) -> list[dict[str, Any]]:
-    keys = [_norm_header(str(h)) for h in headers]
-    items: list[dict[str, Any]] = []
-    for row in rows:
-        if not row or all(str(c or "").strip() == "" for c in row):
-            continue
-        item: dict[str, Any] = {}
-        for i, key in enumerate(keys):
-            if not key or key.startswith("unnamed"):
-                continue
-            val = row[i] if i < len(row) else ""
-            item[key] = "" if val is None else str(val).strip()
-        items.append(item)
-    return normalize_entries(items)
-
-
-def _headers_look_like_faq(headers: list[str]) -> bool:
-    mapped = {_norm_header(h) for h in headers if str(h or "").strip()}
-    return "question" in mapped and "answer" in mapped
-
-
-def _pick_excel_sheets(sheet_titles: list[str]) -> list[str]:
-    """优先 FAQ数据，跳过字段说明，其余按原顺序。"""
-    skip = {"字段说明", "说明"}
-    preferred = [n for n in sheet_titles if n == "FAQ数据"]
-    others = [n for n in sheet_titles if n not in preferred and n not in skip]
-    return preferred + others + [n for n in sheet_titles if n in skip and n not in preferred]
-
-
-def _parse_xlsx(data: bytes) -> list[dict[str, Any]]:
-    try:
-        from openpyxl import load_workbook
-    except ImportError as exc:
-        raise ValueError("解析 xlsx 需要 openpyxl，请安装依赖") from exc
-    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    try:
-        by_title = {ws.title: ws for ws in wb.worksheets}
-        if not by_title:
-            raise ValueError("xlsx 为空")
-        for name in _pick_excel_sheets(list(by_title.keys())):
-            ws = by_title[name]
-            rows_iter = ws.iter_rows(values_only=True)
-            try:
-                header_row = next(rows_iter)
-            except StopIteration:
-                continue
-            headers = ["" if c is None else str(c) for c in header_row]
-            if not _headers_look_like_faq(headers):
-                continue
-            body = [list(r) for r in rows_iter]
-            return _parse_table_rows(headers, body)
-        raise ValueError(
-            "xlsx 中未找到有效 FAQ 表（表头需含「标准问」与「答案」，"
-            "或 question 与 answer）"
-        )
-    finally:
-        wb.close()
-
-
-def _parse_xls(data: bytes) -> list[dict[str, Any]]:
-    try:
-        import xlrd
-    except ImportError as exc:
-        raise ValueError("解析 xls 需要 xlrd，请安装依赖") from exc
-    book = xlrd.open_workbook(file_contents=data)
-    names = book.sheet_names()
-    if not names:
-        raise ValueError("xls 为空")
-    for name in _pick_excel_sheets(names):
-        sheet = book.sheet_by_name(name)
-        if sheet.nrows < 1:
-            continue
-        headers = [str(sheet.cell_value(0, c)) for c in range(sheet.ncols)]
-        if not _headers_look_like_faq(headers):
-            continue
-        body = [
-            [sheet.cell_value(r, c) for c in range(sheet.ncols)]
-            for r in range(1, sheet.nrows)
-        ]
-        return _parse_table_rows(headers, body)
-    raise ValueError(
-        "xls 中未找到有效 FAQ 表（表头需含「标准问」与「答案」，"
-        "或 question 与 answer）"
-    )
 
 
 def _render_json(entries: list[dict[str, Any]]) -> bytes:
