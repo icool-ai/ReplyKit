@@ -10,6 +10,13 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlencode
 
+from mp_agent.dao.redis_client import (
+    feishu_user_access_cache_get,
+    feishu_user_access_cache_invalidate,
+    feishu_user_access_cache_put,
+    oauth_state_consume,
+    oauth_state_put,
+)
 from src.channel_store import ChannelStore
 from src.channels.feishu import http_json
 
@@ -24,8 +31,9 @@ AUTHORIZE_URL = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
 TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v2/oauth/token"
 
 _STATE_TTL_SEC = 900
+# 优雅降级：Redis 不可用时退回到进程内内存 dict
 _state_lock = threading.Lock()
-_oauth_states: dict[str, tuple[str, str, float]] = {}  # state → (config_id, open_id, exp)
+_oauth_states_fallback: dict[str, tuple[str, str, float]] = {}  # state → (cid, oid, exp)
 
 
 @dataclass(frozen=True)
@@ -49,10 +57,14 @@ def create_oauth_state(config_id: str, open_id: str) -> str:
     if not cid or not oid:
         raise ValueError("config_id 与 open_id 不能为空")
     state = secrets.token_urlsafe(24)
+    ok = oauth_state_put(state, cid, oid, _STATE_TTL_SEC)
+    if ok:
+        return state
+    # Redis 不可用 → 优雅降级到内存 dict
     exp = time.time() + _STATE_TTL_SEC
     with _state_lock:
         _purge_states_unlocked()
-        _oauth_states[state] = (cid, oid, exp)
+        _oauth_states_fallback[state] = (cid, oid, exp)
     return state
 
 
@@ -60,10 +72,17 @@ def consume_oauth_state(state: str) -> tuple[str, str] | None:
     key = (state or "").strip()
     if not key:
         return None
+    # 1. 先查 Redis（多实例共享首选）
+    cached = oauth_state_consume(key)
+    if cached is not None:
+        cid, oid = cached
+        if cid and oid:
+            return cid, oid
+    # 2. Redis 没命中/不可用 → 查降级内存 dict（单实例场景可用）
     now = time.time()
     with _state_lock:
         _purge_states_unlocked(now)
-        row = _oauth_states.pop(key, None)
+        row = _oauth_states_fallback.pop(key, None)
     if row is None:
         return None
     config_id, open_id, exp = row
@@ -74,9 +93,9 @@ def consume_oauth_state(state: str) -> tuple[str, str] | None:
 
 def _purge_states_unlocked(now: float | None = None) -> None:
     t = time.time() if now is None else now
-    expired = [k for k, (_, _, exp) in _oauth_states.items() if t > exp]
+    expired = [k for k, (_, _, exp) in _oauth_states_fallback.items() if t > exp]
     for k in expired:
-        del _oauth_states[k]
+        del _oauth_states_fallback[k]
 
 
 def build_authorize_url(
@@ -184,19 +203,41 @@ def get_valid_user_access_token(
     app_id: str,
     app_secret: str,
 ) -> str | None:
-    """Return a usable user_access_token, refreshing when needed. None if re-auth required."""
-    row = store.get_feishu_user_token(config_id, open_id)
-    if row is None:
+    """Return a usable user_access_token, refreshing when needed. None if re-auth required.
+
+    三级读路径（性能从高到低）：
+      1. Redis 缓存命中 → 直接返回（缓存 TTL 已提前 2min 自然过期，拿到的一定可用）
+      2. SQLite DB 命中且未过期 → 回填 Redis → 返回
+      3. SQLite 命中但即将过期 → refresh_token 换票 → 写 DB + 写 Redis → 返回
+      4. 全部失败 → 失效缓存 → 返回 None（前端引导重新授权）
+    """
+    cid = config_id.strip()
+    oid = open_id.strip()
+    if not cid or not oid:
         return None
     now = int(time.time())
-    # Refresh ~2 minutes before expiry.
+    # ---------- 路径 1: Redis 缓存命中 ----------
+    cached = feishu_user_access_cache_get(cid, oid)
+    if cached:
+        return cached
+    # ---------- 路径 2/3: 查 DB ----------
+    row = store.get_feishu_user_token(cid, oid)
+    if row is None:
+        return None
+    # DB 中存在且仍有 > 120s 有效期 → 直接用并回填缓存
     if row.expires_at > now + 120 and row.access_token:
+        ttl_left = row.expires_at - now - 120
+        if ttl_left > 0:
+            feishu_user_access_cache_put(cid, oid, row.access_token, ttl_left)
         return row.access_token
+    # DB 过期了 → refresh
     if not row.refresh_token:
-        store.delete_feishu_user_token(config_id, open_id)
+        store.delete_feishu_user_token(cid, oid)
+        feishu_user_access_cache_invalidate(cid, oid)
         return None
     if row.refresh_expires_at is not None and row.refresh_expires_at <= now:
-        store.delete_feishu_user_token(config_id, open_id)
+        store.delete_feishu_user_token(cid, oid)
+        feishu_user_access_cache_invalidate(cid, oid)
         return None
     try:
         fresh = refresh_user_access_token(
@@ -211,16 +252,21 @@ def get_valid_user_access_token(
             open_id,
             exc,
         )
-        store.delete_feishu_user_token(config_id, open_id)
+        store.delete_feishu_user_token(cid, oid)
+        feishu_user_access_cache_invalidate(cid, oid)
         return None
     store.upsert_feishu_user_token(
-        config_id,
-        open_id,
+        cid,
+        oid,
         access_token=fresh.access_token,
         refresh_token=fresh.refresh_token or row.refresh_token,
         expires_at=fresh.expires_at,
         refresh_expires_at=fresh.refresh_expires_at,
     )
+    # refresh 成功后写 Redis（TTL = 新 expires_at - now - 120）
+    ttl_new = fresh.expires_at - now - 120
+    if ttl_new > 0:
+        feishu_user_access_cache_put(cid, oid, fresh.access_token, ttl_new)
     return fresh.access_token
 
 

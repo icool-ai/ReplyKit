@@ -1,7 +1,9 @@
-"""FAQ source-of-truth store (P3-3): SQLAlchemy CRUD + JSON import."""
+"""FAQ source-of-truth store (P3-3): SQLAlchemy CRUD + JSON import + Redis cache."""
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -13,8 +15,14 @@ from sqlalchemy.orm import Session
 from mp_agent.dao._helpers import dt_to_unix, utc_now
 from mp_agent.dao._engine_normalize import normalize_store_engine
 from mp_agent.dao.models import Faq
+from mp_agent.dao.redis_client import cache_delete, cache_get, cache_setex
 from mp_agent.dao.sync_db import sync_engine
 from src.config import PROJECT_ROOT
+
+_logger = logging.getLogger(__name__)
+
+_FAQ_ENABLED_ALL_CACHE_KEY = "cache:faq:enabled_all:v1"
+_FAQ_CACHE_TTL_SEC = 600
 
 
 @dataclass(frozen=True)
@@ -112,9 +120,44 @@ class FaqStore:
             ) or 0
 
     def list_enabled(self) -> list[FaqRow]:
+        """Get all enabled FAQ rows: Redis cache -> DB fallback."""
+        raw = cache_get(_FAQ_ENABLED_ALL_CACHE_KEY)
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [
+                        FaqRow(
+                            id=str(item.get("id", "")),
+                            category=str(item.get("category", "")),
+                            question=str(item.get("question", "")),
+                            answer=str(item.get("answer", "")),
+                            similar=list(item.get("similar") or []),
+                            enabled=bool(item.get("enabled", True)),
+                            created_at=int(item.get("created_at", 0)),
+                            updated_at=int(item.get("updated_at", 0)),
+                        )
+                        for item in parsed
+                    ]
+            except Exception as exc:
+                _logger.warning("解析 Redis FAQ 缓存失败，回源 DB: %s", exc)
+
         with Session(self._engine) as session:
             rows = session.execute(select(Faq).where(Faq.enabled.is_(True)).order_by(Faq.id))
-            return [_row_to_faq(r) for r in rows.scalars()]
+            faq_rows = [_row_to_faq(r) for r in rows.scalars()]
+
+        try:
+            cache_setex(
+                _FAQ_ENABLED_ALL_CACHE_KEY,
+                _FAQ_CACHE_TTL_SEC,
+                json.dumps(
+                    [row.to_dict() for row in faq_rows],
+                    ensure_ascii=False,
+                ),
+            )
+        except Exception as exc:
+            _logger.warning("写 Redis FAQ 缓存失败（忽略）: %s", exc)
+        return faq_rows
 
     def get(self, faq_id: str) -> FaqRow | None:
         faq_id = (faq_id or "").strip()
@@ -210,6 +253,7 @@ class FaqStore:
             )
             session.commit()
 
+        cache_delete(_FAQ_ENABLED_ALL_CACHE_KEY)
         row = self.get(new_id)
         assert row is not None
         return row
@@ -261,6 +305,7 @@ class FaqStore:
             faq.updated_at = utc_now()
             session.commit()
 
+        cache_delete(_FAQ_ENABLED_ALL_CACHE_KEY)
         row = self.get(faq_id)
         assert row is not None
         return row
@@ -285,6 +330,8 @@ class FaqStore:
                     session.delete(faq)
                     deleted.append(faq_id)
             session.commit()
+        if deleted:
+            cache_delete(_FAQ_ENABLED_ALL_CACHE_KEY)
         return deleted
 
     def import_entries(self, entries: list[dict[str, Any]]) -> FaqImportResult:

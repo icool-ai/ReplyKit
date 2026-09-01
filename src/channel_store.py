@@ -13,6 +13,8 @@ from typing import Any
 from sqlalchemy import Engine, and_, func, select
 from sqlalchemy.orm import Session
 
+import time as _time
+
 from mp_agent.dao._helpers import dt_to_unix, utc_now
 from mp_agent.dao._engine_normalize import normalize_store_engine
 from mp_agent.dao.models import (
@@ -20,6 +22,10 @@ from mp_agent.dao.models import (
     DifyApiKey,
     FeishuUserToken,
     PlatformSetting,
+)
+from mp_agent.dao.redis_client import (
+    feishu_user_access_cache_invalidate,
+    feishu_user_access_cache_put,
 )
 from mp_agent.dao.sync_db import sync_engine
 from src.config import PROJECT_ROOT
@@ -483,7 +489,12 @@ class ChannelStore:
                 )
                 row.updated_at = now
             db.commit()
-            return _model_to_user_token(row)
+            result = _model_to_user_token(row)
+        # 写入 DB 后同步写 Redis 读穿透缓存（TTL = expires_at - now - 120s，提前 2min 自然过期）
+        ttl_left = int(result.expires_at) - int(_time.time()) - 120
+        if ttl_left > 0 and result.access_token:
+            feishu_user_access_cache_put(cid, oid, result.access_token, ttl_left)
+        return result
 
     def delete_feishu_user_token(self, config_id: str, open_id: str) -> None:
         cid = config_id.strip()
@@ -502,6 +513,8 @@ class ChannelStore:
             if row is not None:
                 db.delete(row)
                 db.commit()
+        # DB 删除后同步失效 Redis 读穿透缓存
+        feishu_user_access_cache_invalidate(cid, oid)
 
 
 def _require_feishu_ready(app_id: str, secret: str, token: str) -> None:

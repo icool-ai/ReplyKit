@@ -120,7 +120,7 @@ from src.sensitive_store import (
     load_patterns_from_url,
     resolve_sensitive_import_path,
 )
-from src.session import SqliteSessionStore
+from src.session import CachedSessionStore, SqliteSessionStore
 
 _bearer_scheme = HTTPBearer(
     auto_error=False,
@@ -626,7 +626,7 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
     init_sync_db()
     business_db_module.configure_business_db()
 
-    store = SqliteSessionStore()
+    store = CachedSessionStore(SqliteSessionStore())
     chat_logs = ChatLogStore()
     faq_store = FaqStore()
     sensitive_store = get_sensitive_store()
