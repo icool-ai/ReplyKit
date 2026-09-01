@@ -7,6 +7,11 @@ Design mirrors ``sync_db.py``:
 * Exposes focused helpers for this project's two use-cases:
   1. JWT access-token blacklist  (场景 1)
   2. Login rate-limit counter    (场景 5)
+
+Testing / override hook:
+  Call ``_reset_global_client(force_redis_url="redis://...")`` to swap the
+  singleton client mid-process (used by test scripts that target a
+  specific Redis endpoint without relying on process-wide env vars).
 """
 
 from __future__ import annotations
@@ -25,9 +30,33 @@ _global_init_lock = threading.Lock()
 _last_connect_fail_ts: float = 0.0
 _CONNECT_BACKOFF_SEC: float = 5.0
 
+_override_redis_url: str | None = None
+_override_redis_lock = threading.Lock()
+
+
+def _reset_global_client(*, force_redis_url: str | None = None) -> None:
+    """Reset (or override) the global Redis client for testing purposes.
+
+    Pass ``force_redis_url`` to bypass ``_build_redis_url`` env resolution
+    and target a specific endpoint; pass ``None`` to clear the override
+    and revert to env-driven behaviour.
+    """
+    global _global_client, _override_redis_url, _last_connect_fail_ts
+    with _override_redis_lock, _global_init_lock:
+        _override_redis_url = force_redis_url
+        _global_client = None
+        _last_connect_fail_ts = 0.0
+
 
 def _build_redis_url() -> str | None:
-    """Resolve REDIS_URL from env, honouring both config sources."""
+    """Resolve REDIS_URL from env, honouring both config sources.
+
+    If an in-process override has been installed via
+    :func:`_reset_global_client`, that value takes precedence (for tests).
+    """
+    with _override_redis_lock:
+        if _override_redis_url:
+            return _override_redis_url
     raw = (
         os.getenv("REDIS_URL")
         or os.getenv("MP_AGENT_REDIS_URL")
@@ -150,13 +179,29 @@ def is_access_blacklisted(jti: str) -> bool:
             return False
 
 
-def revoke_all_access_for_user(username: str, ttl_seconds: int) -> bool:
-    """Revoke ALL access tokens issued *before now* for the given user.
+def revoke_all_access_for_user(
+    username: str,
+    ttl_seconds: int,
+    *,
+    now_margin_seconds: int = 1,
+) -> bool:
+    """Revoke ALL access tokens issued *at or before (now - margin)* for a user.
 
-    Implemented by storing a "revoke-before" unix timestamp per user.
-    ``decode_access`` must compare ``iat < revoke_before``.
-    ``ttl_seconds`` should be >= access_ttl so the marker outlives any
-    currently-issued access token.
+    Marker stores ``max(0, now - now_margin_seconds)`` as the unix timestamp.
+    ``decode_access`` compares ``iat <= marker``.
+
+    Margin strategy — call site picks based on whether *new valid tokens*
+    are expected in the very same second:
+
+    * ``now_margin_seconds=1`` — safe for password changes.  User resets
+      pw and immediately logs in with the new one; the fresh token's
+      ``iat == now`` must NOT be caught by the marker, so marker = now-1.
+    * ``now_margin_seconds=0`` — aggressive for disable-user / explicit
+      logout flows where we want *every* in-flight token (including ones
+      minted this second) revoked.
+
+    ``ttl_seconds >= access_ttl`` ensures the marker outlives any token
+    it is meant to kill.
     """
     if not username or ttl_seconds <= 0:
         return False
@@ -165,7 +210,10 @@ def revoke_all_access_for_user(username: str, ttl_seconds: int) -> bool:
             return False
         try:
             key = f"{_USER_REVOKE_KEY_PREFIX}{username}"
-            r.setex(key, ttl_seconds, str(int(time.time())))
+            marker = int(time.time()) - max(0, int(now_margin_seconds))
+            if marker < 0:
+                marker = 0
+            r.setex(key, ttl_seconds, str(marker))
             return True
         except Exception as exc:
             _logger.warning("Redis revoke-all write failed: %s", exc)

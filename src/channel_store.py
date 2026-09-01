@@ -14,6 +14,7 @@ from sqlalchemy import Engine, and_, func, select
 from sqlalchemy.orm import Session
 
 from mp_agent.dao._helpers import dt_to_unix, utc_now
+from mp_agent.dao._engine_normalize import normalize_store_engine
 from mp_agent.dao.models import (
     ChannelConfig,
     DifyApiKey,
@@ -76,7 +77,7 @@ class ChannelStore:
     """SQLAlchemy-backed store for channel configs and Dify API keys."""
 
     def __init__(self, engine: Engine | None = None) -> None:
-        self._engine = engine or sync_engine
+        self._engine = normalize_store_engine(engine)
 
     def get_setting(self, key: str) -> str:
         k = key.strip()

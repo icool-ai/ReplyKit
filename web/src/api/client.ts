@@ -112,8 +112,15 @@ export async function requestData<T>(promise: Promise<{ data: ApiEnvelope<T> }>)
     return body.data as T
   } catch (err) {
     const ax = err as AxiosError<ApiEnvelope<unknown>>
-    if (ax.response?.data?.message) {
-      throw new ApiError(ax.response.data.code ?? ax.response.status, ax.response.data.message)
+    if (ax.response?.data) {
+      const body = ax.response.data
+      // 优先取顶层 message；如果 data 里有 message/detail，拼成更友好的文案。
+      // 例如 Redis 限流时 data.message = "尝试过于频繁，请 300 秒后重试"
+      const dataMessage =
+        (body.data && typeof body.data === 'object' && 'message' in body.data && (body.data as any).message)
+        || (body.data && typeof body.data === 'object' && 'detail' in body.data && (body.data as any).detail)
+      const msg = dataMessage || body.message || '请求失败'
+      throw new ApiError(body.code ?? ax.response.status, msg)
     }
     if (err instanceof ApiError) throw err
     throw new ApiError(0, ax.message || '网络错误')

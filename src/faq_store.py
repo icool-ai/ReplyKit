@@ -11,6 +11,7 @@ from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
 from mp_agent.dao._helpers import dt_to_unix, utc_now
+from mp_agent.dao._engine_normalize import normalize_store_engine
 from mp_agent.dao.models import Faq
 from mp_agent.dao.sync_db import sync_engine
 from src.config import PROJECT_ROOT
@@ -102,7 +103,7 @@ class FaqStore:
     """SQLAlchemy store for structured FAQ entries."""
 
     def __init__(self, engine: Engine | None = None) -> None:
-        self._engine = engine or sync_engine
+        self._engine = normalize_store_engine(engine)
 
     def count_enabled(self) -> int:
         with Session(self._engine) as session:
