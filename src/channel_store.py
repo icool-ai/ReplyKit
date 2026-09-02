@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
-import time
 import uuid
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, and_, func, select
+from sqlalchemy import Engine, and_, select
 from sqlalchemy.orm import Session
 
 import time as _time
@@ -28,9 +27,20 @@ from mp_agent.dao.redis_client import (
     feishu_user_access_cache_put,
 )
 from mp_agent.dao.sync_db import sync_engine
-from src.config import PROJECT_ROOT
+from src.secrets_crypto import (
+    SecretsCryptoError,
+    decrypt_secret,
+    encrypt_secret,
+    hash_api_key,
+    is_api_key_hash,
+    is_encrypted_secret,
+    mask_api_key_prefix,
+    stored_api_key_prefix,
+    verify_api_key,
+)
 
 CHANNEL_FEISHU = "feishu"
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -55,6 +65,21 @@ class ChannelConfigRow:
     created_at: int
     updated_at: int
 
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "owner_username": self.owner_username,
+            "channel": self.channel,
+            "enabled": self.enabled,
+            "app_id": self.app_id,
+            "app_secret_set": bool(self.app_secret.strip()),
+            "verification_token_set": bool(self.verification_token.strip()),
+            "encrypt_key_set": bool(self.encrypt_key.strip()),
+            "callback_path": "/webhooks/feishu",
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
 
 @dataclass(frozen=True)
 class FeishuUserTokenRow:
@@ -73,10 +98,26 @@ class DifyApiKeyRow:
     name: str
     endpoint: str
     knowledge_id: str
-    api_key: str
+    api_key_prefix: str
     created_at: int
     updated_at: int
     last_used_at: int | None
+
+    def to_public_dict(
+        self, *, api_key_plaintext: str | None = None
+    ) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "endpoint": self.endpoint,
+            "knowledge_id": self.knowledge_id,
+            "api_key_masked": mask_api_key_prefix(self.api_key_prefix),
+            "api_key_set": bool(self.api_key_prefix),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "last_used_at": self.last_used_at,
+            "api_key": api_key_plaintext,
+        }
 
 
 class ChannelStore:
@@ -84,6 +125,71 @@ class ChannelStore:
 
     def __init__(self, engine: Engine | None = None) -> None:
         self._engine = normalize_store_engine(engine)
+        self.migrate_secrets_at_rest()
+
+    def migrate_secrets_at_rest(self) -> None:
+        """Upgrade legacy plaintext Dify keys / channel secrets / OAuth tokens in place."""
+        try:
+            self._migrate_dify_api_keys()
+            self._migrate_channel_secrets()
+            self._migrate_feishu_user_tokens()
+        except SecretsCryptoError as exc:
+            _logger.error("落库密钥迁移失败: %s", exc)
+            raise
+
+    def _migrate_dify_api_keys(self) -> None:
+        with Session(self._engine) as db:
+            rows = db.execute(select(DifyApiKey)).scalars().all()
+            changed = 0
+            for row in rows:
+                stored = str(row.api_key or "")
+                if not stored or is_api_key_hash(stored):
+                    continue
+                row.api_key = hash_api_key(stored)
+                row.updated_at = utc_now()
+                changed += 1
+            if changed:
+                db.commit()
+                _logger.info("已将 %s 条 Dify API Key 升级为哈希存储", changed)
+
+    def _migrate_channel_secrets(self) -> None:
+        fields = ("app_secret", "verification_token", "encrypt_key")
+        with Session(self._engine) as db:
+            rows = db.execute(select(ChannelConfig)).scalars().all()
+            changed = 0
+            for row in rows:
+                dirty = False
+                for name in fields:
+                    value = str(getattr(row, name) or "")
+                    if not value or is_encrypted_secret(value):
+                        continue
+                    setattr(row, name, encrypt_secret(value))
+                    dirty = True
+                if dirty:
+                    row.updated_at = utc_now()
+                    changed += 1
+            if changed:
+                db.commit()
+                _logger.info("已将 %s 条渠道密钥升级为 AES-GCM 密文", changed)
+
+    def _migrate_feishu_user_tokens(self) -> None:
+        with Session(self._engine) as db:
+            rows = db.execute(select(FeishuUserToken)).scalars().all()
+            changed = 0
+            for row in rows:
+                dirty = False
+                for name in ("access_token", "refresh_token"):
+                    value = str(getattr(row, name) or "")
+                    if not value or is_encrypted_secret(value):
+                        continue
+                    setattr(row, name, encrypt_secret(value))
+                    dirty = True
+                if dirty:
+                    row.updated_at = utc_now()
+                    changed += 1
+            if changed:
+                db.commit()
+                _logger.info("已将 %s 条飞书 OAuth token 升级为 AES-GCM 密文", changed)
 
     def get_setting(self, key: str) -> str:
         k = key.strip()
@@ -128,11 +234,14 @@ class ChannelStore:
             return None
         with Session(self._engine) as db:
             rows = db.execute(select(DifyApiKey)).scalars().all()
-        for row in rows:
-            stored = str(row.api_key or "")
-            if len(stored) == len(provided) and secrets.compare_digest(
-                stored, provided
-            ):
+            for row in rows:
+                stored = str(row.api_key or "")
+                if not verify_api_key(stored, provided):
+                    continue
+                if not is_api_key_hash(stored):
+                    row.api_key = hash_api_key(provided)
+                    row.updated_at = utc_now()
+                    db.commit()
                 return _model_to_dify_key(row)
         return None
 
@@ -165,7 +274,7 @@ class ChannelStore:
                     name=n,
                     endpoint=ep,
                     knowledge_id=kid,
-                    api_key=plaintext,
+                    api_key=hash_api_key(plaintext),
                     created_at=now,
                     updated_at=now,
                     last_used_at=None,
@@ -290,15 +399,16 @@ class ChannelStore:
         if not tok:
             return None
         with Session(self._engine) as db:
-            row = db.scalar(
-                select(ChannelConfig).where(
-                    and_(
-                        ChannelConfig.channel == channel,
-                        ChannelConfig.verification_token == tok,
-                    )
-                )
-            )
-            return _model_to_config(row) if row else None
+            rows = db.execute(
+                select(ChannelConfig).where(ChannelConfig.channel == channel)
+            ).scalars().all()
+            for row in rows:
+                plain = decrypt_secret(str(row.verification_token or ""))
+                if not plain:
+                    continue
+                if len(plain) == len(tok) and secrets.compare_digest(plain, tok):
+                    return _model_to_config(row)
+        return None
 
     def list_enabled_feishu(self) -> list[ChannelConfigRow]:
         with Session(self._engine) as db:
@@ -372,9 +482,9 @@ class ChannelStore:
                         channel=CHANNEL_FEISHU,
                         enabled=bool(enabled),
                         app_id=app_id_v,
-                        app_secret=secret,
-                        verification_token=token,
-                        encrypt_key=enc,
+                        app_secret=encrypt_secret(secret),
+                        verification_token=encrypt_secret(token),
+                        encrypt_key=encrypt_secret(enc),
                         created_at=now,
                         updated_at=now,
                     )
@@ -407,9 +517,9 @@ class ChannelStore:
                 raise KeyError("配置不存在")
             row.enabled = bool(enabled)
             row.app_id = app_id_v
-            row.app_secret = secret
-            row.verification_token = token
-            row.encrypt_key = enc
+            row.app_secret = encrypt_secret(secret)
+            row.verification_token = encrypt_secret(token)
+            row.encrypt_key = encrypt_secret(enc)
             row.updated_at = now
             db.commit()
             return _model_to_config(row)
@@ -454,6 +564,8 @@ class ChannelStore:
         if not cid or not oid:
             raise ValueError("config_id 与 open_id 不能为空")
         now = utc_now()
+        access_plain = access_token.strip()
+        refresh_plain = refresh_token.strip()
         with Session(self._engine) as db:
             row = db.scalar(
                 select(FeishuUserToken).where(
@@ -467,8 +579,8 @@ class ChannelStore:
                 row = FeishuUserToken(
                     config_id=cid,
                     open_id=oid,
-                    access_token=access_token.strip(),
-                    refresh_token=refresh_token.strip(),
+                    access_token=encrypt_secret(access_plain),
+                    refresh_token=encrypt_secret(refresh_plain),
                     expires_at=int(expires_at),
                     refresh_expires_at=(
                         int(refresh_expires_at)
@@ -479,8 +591,8 @@ class ChannelStore:
                 )
                 db.add(row)
             else:
-                row.access_token = access_token.strip()
-                row.refresh_token = refresh_token.strip()
+                row.access_token = encrypt_secret(access_plain)
+                row.refresh_token = encrypt_secret(refresh_plain)
                 row.expires_at = int(expires_at)
                 row.refresh_expires_at = (
                     int(refresh_expires_at)
@@ -533,12 +645,13 @@ def _require_feishu_ready(app_id: str, secret: str, token: str) -> None:
 
 def _model_to_dify_key(m: DifyApiKey) -> DifyApiKeyRow:
     last_used = dt_to_unix(m.last_used_at) if m.last_used_at else None
+    stored = str(m.api_key or "")
     return DifyApiKeyRow(
         id=str(m.id),
         name=str(m.name or ""),
         endpoint=str(m.endpoint or ""),
         knowledge_id=str(m.knowledge_id or ""),
-        api_key=str(m.api_key or ""),
+        api_key_prefix=stored_api_key_prefix(stored),
         created_at=dt_to_unix(m.created_at),
         updated_at=dt_to_unix(m.updated_at),
         last_used_at=last_used,
@@ -552,9 +665,9 @@ def _model_to_config(m: ChannelConfig) -> ChannelConfigRow:
         channel=str(m.channel),
         enabled=bool(m.enabled),
         app_id=str(m.app_id or ""),
-        app_secret=str(m.app_secret or ""),
-        verification_token=str(m.verification_token or ""),
-        encrypt_key=str(m.encrypt_key or ""),
+        app_secret=decrypt_secret(str(m.app_secret or "")),
+        verification_token=decrypt_secret(str(m.verification_token or "")),
+        encrypt_key=decrypt_secret(str(m.encrypt_key or "")),
         created_at=dt_to_unix(m.created_at),
         updated_at=dt_to_unix(m.updated_at),
     )
@@ -564,8 +677,8 @@ def _model_to_user_token(m: FeishuUserToken) -> FeishuUserTokenRow:
     return FeishuUserTokenRow(
         config_id=str(m.config_id),
         open_id=str(m.open_id),
-        access_token=str(m.access_token or ""),
-        refresh_token=str(m.refresh_token or ""),
+        access_token=decrypt_secret(str(m.access_token or "")),
+        refresh_token=decrypt_secret(str(m.refresh_token or "")),
         expires_at=int(m.expires_at or 0),
         refresh_expires_at=(
             int(m.refresh_expires_at) if m.refresh_expires_at is not None else None
