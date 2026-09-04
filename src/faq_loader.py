@@ -41,6 +41,9 @@ def faq_entry_to_documents(
     category: str = "",
     source: str = "faq_db",
     max_similar: int = DEFAULT_MAX_SIMILAR,
+    owner_username: str = "",
+    visibility: str = "public",
+    allow_egress: bool = True,
 ) -> list[Document]:
     """Expand one FAQ into multiple vectors (standard + each similar)."""
     question = (question or "").strip()
@@ -66,6 +69,10 @@ def faq_entry_to_documents(
                     "match_text": text,
                     "phrase_index": phrase_index,
                     "embed_mode": "per_phrase",
+                    "owner_username": (owner_username or "").strip(),
+                    "visibility": (visibility or "public").strip().lower()
+                    or "public",
+                    "allow_egress": bool(allow_egress),
                     "images": [],
                 },
             )

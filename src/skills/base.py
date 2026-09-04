@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class ChannelContext:
-    """IM / web identity for the current turn (set under bot_lock)."""
+    """IM / web identity for the current turn (set on forked bot per session lock)."""
 
     channel: str = "web"  # web | feishu
     open_id: str = ""

@@ -17,11 +17,16 @@ from mp_agent.dao._engine_normalize import normalize_store_engine
 from mp_agent.dao.models import Faq
 from mp_agent.dao.redis_client import cache_delete, cache_get, cache_setex
 from mp_agent.dao.sync_db import sync_engine
+from src.acl import (
+    VISIBILITY_PUBLIC,
+    normalize_allow_egress,
+    normalize_visibility,
+)
 from src.config import PROJECT_ROOT
 
 _logger = logging.getLogger(__name__)
 
-_FAQ_ENABLED_ALL_CACHE_KEY = "cache:faq:enabled_all:v1"
+_FAQ_ENABLED_ALL_CACHE_KEY = "cache:faq:enabled_all:v2"
 _FAQ_CACHE_TTL_SEC = 600
 
 
@@ -33,6 +38,9 @@ class FaqRow:
     answer: str
     similar: list[str]
     enabled: bool
+    owner_username: str
+    visibility: str
+    allow_egress: bool
     created_at: int
     updated_at: int
 
@@ -44,6 +52,9 @@ class FaqRow:
             "answer": self.answer,
             "similar": list(self.similar),
             "enabled": self.enabled,
+            "owner_username": self.owner_username,
+            "visibility": self.visibility,
+            "allow_egress": self.allow_egress,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -87,8 +98,33 @@ def _row_to_faq(faq: Faq) -> FaqRow:
         answer=faq.answer,
         similar=[str(s).strip() for s in similar if str(s).strip()],
         enabled=faq.enabled,
+        owner_username=str(getattr(faq, "owner_username", "") or ""),
+        visibility=normalize_visibility(
+            getattr(faq, "visibility", VISIBILITY_PUBLIC)
+        ),
+        allow_egress=normalize_allow_egress(
+            getattr(faq, "allow_egress", True), default=True
+        ),
         created_at=dt_to_unix(faq.created_at),
         updated_at=dt_to_unix(faq.updated_at),
+    )
+
+
+def _faq_row_from_cache_item(item: dict[str, Any]) -> FaqRow:
+    return FaqRow(
+        id=str(item.get("id", "")),
+        category=str(item.get("category", "")),
+        question=str(item.get("question", "")),
+        answer=str(item.get("answer", "")),
+        similar=list(item.get("similar") or []),
+        enabled=bool(item.get("enabled", True)),
+        owner_username=str(item.get("owner_username", "") or ""),
+        visibility=normalize_visibility(item.get("visibility")),
+        allow_egress=normalize_allow_egress(
+            item.get("allow_egress"), default=True
+        ),
+        created_at=int(item.get("created_at", 0)),
+        updated_at=int(item.get("updated_at", 0)),
     )
 
 
@@ -126,19 +162,7 @@ class FaqStore:
             try:
                 parsed = json.loads(raw)
                 if isinstance(parsed, list):
-                    return [
-                        FaqRow(
-                            id=str(item.get("id", "")),
-                            category=str(item.get("category", "")),
-                            question=str(item.get("question", "")),
-                            answer=str(item.get("answer", "")),
-                            similar=list(item.get("similar") or []),
-                            enabled=bool(item.get("enabled", True)),
-                            created_at=int(item.get("created_at", 0)),
-                            updated_at=int(item.get("updated_at", 0)),
-                        )
-                        for item in parsed
-                    ]
+                    return [_faq_row_from_cache_item(item) for item in parsed]
             except Exception as exc:
                 _logger.warning("解析 Redis FAQ 缓存失败，回源 DB: %s", exc)
 
@@ -224,6 +248,9 @@ class FaqStore:
         category: str = "",
         faq_id: str | None = None,
         enabled: bool = True,
+        owner_username: str = "",
+        visibility: str = VISIBILITY_PUBLIC,
+        allow_egress: bool = True,
     ) -> FaqRow:
         question = (question or "").strip()
         answer = (answer or "").strip()
@@ -232,6 +259,9 @@ class FaqStore:
 
         similar_list = _normalize_similar(similar)
         category = (category or "").strip()
+        owner = (owner_username or "").strip()
+        vis = normalize_visibility(visibility)
+        egress = bool(allow_egress)
         now = utc_now()
         new_id = (faq_id or "").strip() or self._next_id()
 
@@ -247,6 +277,9 @@ class FaqStore:
                     answer=answer,
                     similar=similar_list,
                     enabled=bool(enabled),
+                    owner_username=owner,
+                    visibility=vis,
+                    allow_egress=egress,
                     created_at=now,
                     updated_at=now,
                 )
@@ -267,6 +300,9 @@ class FaqStore:
         similar: list[str] | None = None,
         category: str | None = None,
         enabled: bool | None = None,
+        owner_username: str | None = None,
+        visibility: str | None = None,
+        allow_egress: bool | None = None,
     ) -> FaqRow:
         faq_id = (faq_id or "").strip()
         if not faq_id:
@@ -282,6 +318,9 @@ class FaqStore:
             and similar is None
             and category is None
             and enabled is None
+            and owner_username is None
+            and visibility is None
+            and allow_egress is None
         ):
             raise ValueError("至少需要更新一个字段")
 
@@ -292,6 +331,19 @@ class FaqStore:
         new_similar = current.similar if similar is None else _normalize_similar(similar)
         new_category = current.category if category is None else category.strip()
         new_enabled = current.enabled if enabled is None else bool(enabled)
+        new_owner = (
+            current.owner_username
+            if owner_username is None
+            else owner_username.strip()
+        )
+        new_visibility = (
+            current.visibility
+            if visibility is None
+            else normalize_visibility(visibility)
+        )
+        new_egress = (
+            current.allow_egress if allow_egress is None else bool(allow_egress)
+        )
 
         with Session(self._engine) as session:
             faq = session.get(Faq, faq_id)
@@ -302,6 +354,9 @@ class FaqStore:
             faq.similar = new_similar
             faq.category = new_category
             faq.enabled = new_enabled
+            faq.owner_username = new_owner
+            faq.visibility = new_visibility
+            faq.allow_egress = new_egress
             faq.updated_at = utc_now()
             session.commit()
 
@@ -355,6 +410,13 @@ class FaqStore:
             enabled_raw = item.get("enabled", True)
             enabled = bool(enabled_raw) if enabled_raw is not None else True
 
+            owner = str(item.get("owner_username") or "").strip()
+            visibility = normalize_visibility(
+                item.get("visibility", VISIBILITY_PUBLIC)
+            )
+            allow_egress = normalize_allow_egress(
+                item.get("allow_egress"), default=True
+            )
             row = self.create(
                 question=question,
                 answer=answer,
@@ -362,6 +424,9 @@ class FaqStore:
                 category=category,
                 faq_id=None,
                 enabled=enabled,
+                owner_username=owner,
+                visibility=visibility,
+                allow_egress=allow_egress,
             )
             imported += 1
             touched.append(row.id)

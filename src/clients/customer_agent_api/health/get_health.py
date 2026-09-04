@@ -16,7 +16,7 @@ from ..shared.types import HealthResponse
 
 
 def get_health(*, base_url: str, timeout: float = 60.0) -> HealthResponse:
-    """Health check — envelope data is ``{"status": "ok"}``."""
+    """Health check — envelope data includes ``status`` and optional ``redis``."""
     url = join_url(base_url, "/health")
     payload = request_json("GET", url, timeout=timeout)
     return HealthResponse.from_dict(payload or {})

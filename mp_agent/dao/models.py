@@ -20,6 +20,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+# SQLite only autoincrements INTEGER PRIMARY KEY; keep BIGINT on other dialects.
+_AutoIncPK = BigInteger().with_variant(Integer, "sqlite")
+
 
 class Base(DeclarativeBase):
     pass
@@ -283,7 +286,7 @@ class ChatSession(Base):
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(_AutoIncPK, primary_key=True, autoincrement=True)
     session_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False
     )
@@ -309,7 +312,7 @@ class ChatLog(Base):
 
     __tablename__ = "chat_logs"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(_AutoIncPK, primary_key=True, autoincrement=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     session_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     username: Mapped[str] = mapped_column(String(32), default="", nullable=False)
@@ -356,6 +359,11 @@ class Faq(Base):
     answer: Mapped[str] = mapped_column(Text, nullable=False)
     similar: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+    # Document ACL: public = all authenticated users; private = owner (+ ops)
+    owner_username: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    visibility: Mapped[str] = mapped_column(String(16), default="public", nullable=False)
+    # False: may be retrieved privately but must not be sent to public model APIs
+    allow_egress: Mapped[bool] = mapped_column(default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
@@ -365,6 +373,8 @@ class Faq(Base):
         Index("idx_faqs_updated", "updated_at"),
         Index("idx_faqs_category", "category"),
         Index("idx_faqs_enabled", "enabled"),
+        Index("idx_faqs_owner", "owner_username"),
+        Index("idx_faqs_visibility", "visibility"),
     )
 
 

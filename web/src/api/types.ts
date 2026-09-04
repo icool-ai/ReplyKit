@@ -22,6 +22,12 @@ export interface FaqItem {
   answer: string
   similar: string[]
   enabled: boolean
+  /** 文档所有者；visibility=private 时仅本人与 ops 可检索 */
+  owner_username: string
+  /** public=登录用户可见；private=仅 owner + ops */
+  visibility: 'public' | 'private' | string
+  /** false：仅可本地直出标准答，禁止把内容送给公网大模型 */
+  allow_egress: boolean
   created_at: number
   updated_at: number
 }
@@ -43,6 +49,9 @@ export interface FaqCreateBody {
   category?: string
   id?: string
   enabled?: boolean
+  owner_username?: string
+  visibility?: 'public' | 'private' | string
+  allow_egress?: boolean
 }
 
 export interface FaqUpdateBody {
@@ -52,4 +61,7 @@ export interface FaqUpdateBody {
   similar?: string[]
   category?: string
   enabled?: boolean
+  owner_username?: string
+  visibility?: 'public' | 'private' | string
+  allow_egress?: boolean
 }

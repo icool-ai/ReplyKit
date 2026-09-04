@@ -6,11 +6,12 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Callable
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
 
+from src.acl import RetrievalPrincipal, filter_docs_for_egress
 from src.chitchat import (
     contains_sensitive,
     sensitive_reply,
@@ -22,6 +23,7 @@ from src.context import (
     resolve_search_query,
     topic_from_docs,
 )
+from src.egress import redact_pii
 from src.flow_feishu_task import FeishuTaskFlow
 from src.flow_order import OrderQueryFlow
 from src.flow_ticket import TicketCreateFlow
@@ -39,6 +41,7 @@ from src.knowledge import (
     ensure_vectorstore,
     search_faq,
 )
+from src.model_gateway import get_model_gateway
 from src.tools.business_db import configure_business_db
 
 SYSTEM_PROMPT = """你是一名专业、友好的智能客服助手。
@@ -107,6 +110,30 @@ class ChatResult:
     top_score: float | None = None
     clarify_options: list[str] = field(default_factory=list)
     skill_trace: list[str] = field(default_factory=list)
+
+
+def _llm_chunk_text(chunk: Any) -> str:
+    """Normalize LangChain stream chunk content to plain text."""
+    content = getattr(chunk, "content", None)
+    if content is None:
+        return str(chunk) if chunk is not None else ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if text:
+                    parts.append(str(text))
+            else:
+                text = getattr(block, "text", None)
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+    return str(content)
 
 
 def _log(title: str, body: str = "") -> None:
@@ -226,18 +253,13 @@ def _context_from_docs(docs: list[Document]) -> str:
             parts.append(f"【FAQ】Q：{q}\nA：{a}")
         else:
             parts.append(doc.page_content)
-    return "\n\n---\n\n".join(parts)
+    return redact_pii("\n\n---\n\n".join(parts))
 
 
 class CustomerServiceBot:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.llm = ChatOpenAI(
-            model=settings.chat_model,
-            openai_api_key=settings.dashscope_api_key,
-            openai_api_base=settings.openai_api_base,
-            temperature=float(settings.answer_temperature),
-        )
+        self.llm = get_model_gateway(settings).chat_llm(purpose="chat")
         self.prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", SYSTEM_PROMPT),
@@ -254,9 +276,39 @@ class CustomerServiceBot:
         self.order_flow = OrderQueryFlow()
         self.ticket_flow = TicketCreateFlow()
         self.feishu_task_flow = FeishuTaskFlow()
-        self.channel_ctx = None  # set/cleared by API under bot_lock
+        self.channel_ctx = None  # set/cleared per turn (fork isolates sessions)
+        self.principal = RetrievalPrincipal()
+        # Optional stream hooks for SSE (set for one turn, cleared in finally).
+        self._stream_on_status = None
+        self._stream_on_delta = None
+        self._stream_delta_emitted = False
         configure_business_db()
         self._ensure_vectorstore()
+
+    def fork_for_turn(self) -> "CustomerServiceBot":
+        """Share LLM/settings/vectorstore; isolate mutable session state.
+
+        Enables concurrent turns on different sessions without a global bot lock.
+        """
+        other = CustomerServiceBot.__new__(CustomerServiceBot)
+        other.settings = self.settings
+        other.llm = self.llm
+        other.prompt = self.prompt
+        other.last_topic = ""
+        other.last_clarify_options = []
+        other.last_effective_query = ""
+        other.consecutive_no_answer = 0
+        other.repeat_count = 0
+        other.last_user_norm = ""
+        other.order_flow = OrderQueryFlow()
+        other.ticket_flow = TicketCreateFlow()
+        other.feishu_task_flow = FeishuTaskFlow()
+        other.channel_ctx = None
+        other.principal = RetrievalPrincipal()
+        other._stream_on_status = None
+        other._stream_on_delta = None
+        other._stream_delta_emitted = False
+        return other
 
     def reset_session(self) -> None:
         self.last_topic = ""
@@ -381,7 +433,10 @@ class CustomerServiceBot:
             if not q:
                 continue
             docs, cands, route = search_faq(
-                self.settings, q, k=self.settings.top_k
+                self.settings,
+                q,
+                k=self.settings.top_k,
+                principal=self.principal,
             )
             _log("FAQ 检索问句", q)
             if cands:
@@ -449,11 +504,17 @@ class CustomerServiceBot:
                     ),
                 )
             docs, candidates, route = search_faq(
-                self.settings, search_query, k=self.settings.top_k
+                self.settings,
+                search_query,
+                k=self.settings.top_k,
+                principal=self.principal,
             )
         else:
             docs, candidates, route = search_faq(
-                self.settings, search_query, k=self.settings.top_k
+                self.settings,
+                search_query,
+                k=self.settings.top_k,
+                principal=self.principal,
             )
 
         return self._finalize_faq_turn(
@@ -643,6 +704,32 @@ class CustomerServiceBot:
         elif _is_structured_faq(top) and top_score >= direct_th and not can_direct:
             gen_docs = [top]
 
+        # Public model APIs may only see allow_egress chunks.
+        egress_docs = filter_docs_for_egress(gen_docs, default_allow=True)
+        if not egress_docs:
+            if _is_structured_faq(top) and str(top.metadata.get("answer") or "").strip():
+                answer = str(top.metadata.get("answer") or "").strip()
+                _log(
+                    "策略",
+                    "命中 allow_egress=false：本地直出标准答，不调用公网模型",
+                )
+                self._mark_answered()
+                return ChatResult(
+                    answer=answer,
+                    sources=sources[:1],
+                    route="faq",
+                    strategy="direct_no_egress",
+                    faq_id=top_faq_id,
+                    top_score=top_score,
+                )
+            _log("策略", "可见知识均禁止出网且无法直出，拒答")
+            return ChatResult(
+                answer=no_knowledge_reply(),
+                route=route,
+                strategy="reject_no_egress",
+            )
+        gen_docs = egress_docs
+
         context = _context_from_docs(gen_docs)
         if not context.strip():
             self.consecutive_no_answer += 1
@@ -692,14 +779,28 @@ class CustomerServiceBot:
             _log("策略", "文档 RAG + 结合最近对话生成回答")
 
         chain = self.prompt | self.llm
-        response = chain.invoke(
-            {
-                "context": context,
-                "dialogue": dialogue,
-                "question": search_query,
-            }
-        )
-        answer = response.content if hasattr(response, "content") else str(response)
+        inputs = {
+            "context": context,
+            "dialogue": dialogue,
+            "question": search_query,
+        }
+        if self._stream_on_delta is not None:
+            if self._stream_on_status is not None:
+                self._stream_on_status("generating")
+            pieces: list[str] = []
+            for chunk in chain.stream(inputs):
+                text = _llm_chunk_text(chunk)
+                if not text:
+                    continue
+                pieces.append(text)
+                self._stream_on_delta(text)
+                self._stream_delta_emitted = True
+            answer = "".join(pieces)
+        else:
+            response = chain.invoke(inputs)
+            answer = (
+                response.content if hasattr(response, "content") else str(response)
+            )
         self._mark_answered()
 
         _log("模型原始返回", str(answer))
@@ -736,6 +837,37 @@ class CustomerServiceBot:
         return result.answer, result.sources, result.images
 
     def chat_result(
+        self,
+        user_message: str,
+        history: list | None = None,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_delta: Callable[[str], None] | None = None,
+        username: str = "",
+        role: str = "user",
+    ) -> ChatResult:
+        """Full result including route/strategy metadata (for regression tests).
+
+        Optional ``on_status`` / ``on_delta`` enable true token streaming for RAG
+        paths; fixed answers leave deltas to the caller if none were emitted.
+        """
+        self.principal = RetrievalPrincipal(
+            username=username or "",
+            role=role or "user",
+        )
+        self._stream_on_status = on_status
+        self._stream_on_delta = on_delta
+        self._stream_delta_emitted = False
+        try:
+            if on_status is not None:
+                on_status("thinking")
+            return self._chat_result_inner(user_message, history)
+        finally:
+            self._stream_on_status = None
+            self._stream_on_delta = None
+            self.principal = RetrievalPrincipal()
+
+    def _chat_result_inner(
         self,
         user_message: str,
         history: list | None = None,

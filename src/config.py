@@ -80,10 +80,19 @@ class Settings:
     login_rate_limit: int
     login_rate_window_sec: int
     session_cache_ttl: int
+    # Multi-replica: refuse chat-run memory fallback when Redis is required.
+    chat_runs_require_redis: bool
+    # /health returns HTTP 503 when Redis is configured but unreachable.
+    health_redis_strict: bool
     # --- Apache Tika (optional: universal document parser, graceful downgrade) ---
     tika_enabled: bool
     tika_url: str
     tika_timeout_sec: int
+    # --- FAQ ACL + model egress (private KB, public model APIs) ---
+    faq_acl_enabled: bool
+    model_egress_redact_pii: bool
+    model_egress_max_chunk_chars: int
+    model_egress_max_rerank_docs: int
 
     @property
     def score_threshold(self) -> float:
@@ -279,6 +288,14 @@ class Settings:
             login_rate_limit=int(os.getenv("LOGIN_RATE_LIMIT", "5")),
             login_rate_window_sec=int(os.getenv("LOGIN_RATE_WINDOW_SEC", "300")),
             session_cache_ttl=int(os.getenv("SESSION_CACHE_TTL", "1800")),
+            chat_runs_require_redis=os.getenv(
+                "CHAT_RUNS_REQUIRE_REDIS", "false"
+            ).strip().lower()
+            in {"1", "true", "yes", "on"},
+            health_redis_strict=os.getenv(
+                "HEALTH_REDIS_STRICT", "false"
+            ).strip().lower()
+            in {"1", "true", "yes", "on"},
             tika_enabled=os.getenv("TIKA_ENABLED", "true").strip().lower()
             in {"1", "true", "yes", "on"},
             tika_url=os.getenv(
@@ -286,6 +303,18 @@ class Settings:
                 "http://127.0.0.1:9998/tika",
             ).strip(),
             tika_timeout_sec=int(os.getenv("TIKA_TIMEOUT_SEC", "60")),
+            faq_acl_enabled=os.getenv("FAQ_ACL_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes", "on"},
+            model_egress_redact_pii=os.getenv(
+                "MODEL_EGRESS_REDACT_PII", "true"
+            ).strip().lower()
+            in {"1", "true", "yes", "on"},
+            model_egress_max_chunk_chars=int(
+                os.getenv("MODEL_EGRESS_MAX_CHUNK_CHARS", "4000")
+            ),
+            model_egress_max_rerank_docs=int(
+                os.getenv("MODEL_EGRESS_MAX_RERANK_DOCS", "50")
+            ),
         )
 
 

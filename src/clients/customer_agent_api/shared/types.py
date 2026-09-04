@@ -9,10 +9,15 @@ from typing import Any
 @dataclass
 class HealthResponse:
     status: str
+    redis: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> HealthResponse:
-        return cls(status=str(data.get("status", "")))
+        redis = data.get("redis")
+        return cls(
+            status=str(data.get("status", "")),
+            redis=dict(redis) if isinstance(redis, dict) else None,
+        )
 
 
 @dataclass
