@@ -24,6 +24,7 @@ export interface SessionDetail {
   messages: { role: string; content: string }[]
   updated_at: number
   created_at: number
+  active_run_id?: string | null
 }
 
 export function listSessions(page = 1, pageSize = 50) {

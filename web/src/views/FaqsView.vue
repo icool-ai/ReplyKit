@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
 import { createFaq, deleteFaqs, downloadFaqTemplate, importFaqFile, listFaqs, updateFaq } from '@/api/faqs'
@@ -24,11 +24,29 @@ const form = reactive({
   category: '',
   similarText: '',
   enabled: true,
+  visibility: 'public' as 'public' | 'private',
+  owner_username: '',
+  allow_egress: true,
 })
 
-const rules: FormRules = {
+const ownerRequired = computed(() => form.visibility === 'private')
+
+const rules = computed<FormRules>(() => ({
   question: [{ required: true, message: '请输入标准问', trigger: 'blur' }],
   answer: [{ required: true, message: '请输入答案', trigger: 'blur' }],
+  owner_username: ownerRequired.value
+    ? [{ required: true, message: '私有知识请填写所属用户名', trigger: 'blur' }]
+    : [],
+}))
+
+function visibilityLabel(v: string | undefined) {
+  return v === 'private' ? '私有' : '公开'
+}
+
+function resetFormAcl() {
+  form.visibility = 'public'
+  form.owner_username = ''
+  form.allow_egress = true
 }
 
 async function fetchList() {
@@ -55,6 +73,7 @@ function openCreate() {
   form.category = ''
   form.similarText = ''
   form.enabled = true
+  resetFormAcl()
   dialogVisible.value = true
 }
 
@@ -65,6 +84,9 @@ function openEdit(row: FaqItem) {
   form.category = row.category
   form.similarText = row.similar.join('\n')
   form.enabled = row.enabled
+  form.visibility = row.visibility === 'private' ? 'private' : 'public'
+  form.owner_username = row.owner_username || ''
+  form.allow_egress = row.allow_egress !== false
   dialogVisible.value = true
 }
 
@@ -79,6 +101,12 @@ async function submitForm() {
   const ok = await formRef.value?.validate().catch(() => false)
   if (!ok) return
 
+  const acl = {
+    visibility: form.visibility,
+    owner_username: form.owner_username.trim(),
+    allow_egress: form.allow_egress,
+  }
+
   try {
     if (editingId.value) {
       await updateFaq({
@@ -88,6 +116,7 @@ async function submitForm() {
         category: form.category,
         similar: parseSimilar(form.similarText),
         enabled: form.enabled,
+        ...acl,
       })
       ElMessage.success('已更新')
     } else {
@@ -97,6 +126,7 @@ async function submitForm() {
         category: form.category,
         similar: parseSimilar(form.similarText),
         enabled: form.enabled,
+        ...acl,
       })
       ElMessage.success('已创建')
     }
@@ -218,13 +248,32 @@ onMounted(() => {
     </div>
 
     <el-table v-loading="loading" :data="items" stripe border>
-      <el-table-column prop="category" label="分类" width="120" show-overflow-tooltip />
-      <el-table-column prop="question" label="标准问" min-width="180" show-overflow-tooltip />
-      <el-table-column prop="answer" label="答案" min-width="220" show-overflow-tooltip />
-      <el-table-column label="相似问" width="90">
+      <el-table-column prop="category" label="分类" width="100" show-overflow-tooltip />
+      <el-table-column prop="question" label="标准问" min-width="160" show-overflow-tooltip />
+      <el-table-column prop="answer" label="答案" min-width="180" show-overflow-tooltip />
+      <el-table-column label="可见范围" width="88">
+        <template #default="{ row }">
+          <el-tag :type="row.visibility === 'private' ? 'warning' : 'info'" size="small">
+            {{ visibilityLabel(row.visibility) }}
+          </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="所属用户" width="110" show-overflow-tooltip>
+        <template #default="{ row }">
+          {{ row.visibility === 'private' ? row.owner_username || '—' : '—' }}
+        </template>
+      </el-table-column>
+      <el-table-column label="送公网模型" width="100">
+        <template #default="{ row }">
+          <el-tag :type="row.allow_egress === false ? 'danger' : 'success'" size="small">
+            {{ row.allow_egress === false ? '禁止' : '允许' }}
+          </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="相似问" width="80">
         <template #default="{ row }">{{ row.similar.length }}</template>
       </el-table-column>
-      <el-table-column label="启用" width="90">
+      <el-table-column label="启用" width="80">
         <template #default="{ row }">
           <el-switch
             :model-value="row.enabled"
@@ -261,10 +310,10 @@ onMounted(() => {
     <el-dialog
       v-model="dialogVisible"
       :title="editingId ? '编辑 FAQ' : '新建 FAQ'"
-      width="640px"
+      width="680px"
       destroy-on-close
     >
-      <el-form ref="formRef" :model="form" :rules="rules" label-width="88px">
+      <el-form ref="formRef" :model="form" :rules="rules" label-width="108px">
         <el-form-item label="标准问" prop="question">
           <el-input v-model="form.question" />
         </el-form-item>
@@ -284,6 +333,35 @@ onMounted(() => {
         </el-form-item>
         <el-form-item label="启用">
           <el-switch v-model="form.enabled" />
+        </el-form-item>
+
+        <el-divider content-position="left">访问控制</el-divider>
+        <p class="acl-hint">
+          「送公网模型」指：命中本条后，是否允许把内容发给通义等公网大模型做润色。
+          关闭后仍可问答，一般会直接返回标准答案。与用户能否打开网页无关。
+        </p>
+        <el-form-item label="可见范围">
+          <el-radio-group v-model="form.visibility">
+            <el-radio label="public">公开（登录用户可检索）</el-radio>
+            <el-radio label="private">私有（仅所属用户 + 运营）</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item
+          v-if="form.visibility === 'private'"
+          label="所属用户"
+          prop="owner_username"
+        >
+          <el-input
+            v-model="form.owner_username"
+            placeholder="填写系统登录用户名，如 alice"
+          />
+        </el-form-item>
+        <el-form-item label="送公网模型">
+          <el-switch
+            v-model="form.allow_egress"
+            active-text="允许"
+            inactive-text="禁止"
+          />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -333,5 +411,12 @@ onMounted(() => {
   display: flex;
   justify-content: flex-end;
   margin-top: 16px;
+}
+
+.acl-hint {
+  margin: -4px 0 12px 108px;
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.5;
 }
 </style>

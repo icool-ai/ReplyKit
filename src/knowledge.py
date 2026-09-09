@@ -22,9 +22,11 @@ from qdrant_client.http.models import (
     VectorParams,
 )
 
+from src.acl import RetrievalPrincipal, build_faq_acl_filter
 from src.config import Settings
 from src.faq_loader import faq_entry_to_documents
 from src.faq_store import FaqRow, FaqStore
+from src.model_gateway import get_model_gateway
 from src.tika_parser import extract_text_from_path
 
 CONTENT_KEY = "page_content"
@@ -53,12 +55,7 @@ _vector_lock = RLock()
 
 
 def _get_embeddings(settings: Settings) -> OpenAIEmbeddings:
-    return OpenAIEmbeddings(
-        model=settings.embedding_model,
-        openai_api_key=settings.dashscope_api_key,
-        openai_api_base=settings.openai_api_base,
-        check_embedding_ctx_length=False,
-    )
+    return get_model_gateway(settings).embeddings()
 
 
 def _get_qdrant_client(settings: Settings) -> QdrantClient:
@@ -148,6 +145,9 @@ def _faq_row_to_documents(row: FaqRow, settings: Settings) -> list[Document]:
         category=row.category,
         source=FAQ_DB_SOURCE,
         max_similar=settings.faq_max_similar,
+        owner_username=row.owner_username,
+        visibility=row.visibility,
+        allow_egress=row.allow_egress,
     )
 
 
@@ -280,6 +280,31 @@ def _any_chunk_has_per_phrase_faq(settings: Settings) -> bool:
     return False
 
 
+def _any_chunk_has_acl_payload(settings: Settings) -> bool:
+    """True when FAQ vectors carry visibility (required after ACL rollout)."""
+    client = _get_qdrant_client(settings)
+    if not _collection_exists(client, settings.collection_name):
+        return False
+    points, _ = client.scroll(
+        collection_name=settings.collection_name,
+        limit=80,
+        with_payload=True,
+        with_vectors=False,
+        scroll_filter=Filter(
+            must=[
+                FieldCondition(key="doc_type", match=MatchValue(value="faq"))
+            ]
+        ),
+    )
+    if not points:
+        return True
+    for point in points:
+        payload = point.payload or {}
+        if "visibility" not in payload or "allow_egress" not in payload:
+            return False
+    return True
+
+
 def knowledge_needs_rebuild(settings: Settings) -> bool:
     """True when collection is missing or disk manuals / FAQ DB are not indexed."""
     disk_files = _iter_knowledge_files(settings)
@@ -297,6 +322,12 @@ def knowledge_needs_rebuild(settings: Settings) -> bool:
     if has_enabled_faq and not _any_chunk_has_faq_id(settings):
         return True
     if has_enabled_faq and not _any_chunk_has_per_phrase_faq(settings):
+        return True
+    if (
+        settings.faq_acl_enabled
+        and has_enabled_faq
+        and not _any_chunk_has_acl_payload(settings)
+    ):
         return True
     return False
 
@@ -339,12 +370,14 @@ def similarity_search(
     doc_types: list[str] | None = None,
     *,
     apply_threshold: bool = True,
+    principal: RetrievalPrincipal | None = None,
 ) -> tuple[list[Document], list[tuple[float, str, str]]]:
     """Search with scores.
 
     Args:
       doc_types: If set, only search these payload doc_type values (e.g. ["faq"]).
       apply_threshold: When False, return all Top raw hits without clarify filter.
+      principal: When set with FAQ ACL, apply visibility filter at query time.
 
     Returns:
       accepted_docs: score >= clarify threshold (unless apply_threshold=False),
@@ -365,8 +398,14 @@ def similarity_search(
     embeddings = _get_embeddings(settings)
     query_vector = embeddings.embed_query(query)
 
-    query_filter = None
-    if doc_types:
+    who = principal or RetrievalPrincipal()
+    if doc_types == ["faq"] or (doc_types and "faq" in doc_types and len(doc_types) == 1):
+        query_filter = build_faq_acl_filter(
+            who,
+            acl_enabled=settings.faq_acl_enabled,
+            doc_types=doc_types,
+        )
+    elif doc_types:
         if len(doc_types) == 1:
             query_filter = Filter(
                 must=[
@@ -382,6 +421,8 @@ def similarity_search(
                     for t in doc_types
                 ]
             )
+    else:
+        query_filter = None
 
     results = client.query_points(
         collection_name=settings.collection_name,
@@ -423,9 +464,12 @@ def search_faq(
     settings: Settings,
     query: str,
     k: int | None = None,
+    *,
+    principal: RetrievalPrincipal | None = None,
 ) -> tuple[list[Document], list[tuple[float, str, str]], str]:
     """Retrieve FAQ via hybrid (vector+BM25) and optional DashScope rerank."""
     limit = k or settings.top_k
+    who = principal or RetrievalPrincipal()
     # Raw vector hits (no threshold) for hybrid pool
     vector_docs, vector_candidates = similarity_search(
         settings,
@@ -433,6 +477,7 @@ def search_faq(
         k=max(limit, settings.hybrid_vector_k),
         doc_types=["faq"],
         apply_threshold=False,
+        principal=who,
     )
 
     if not settings.hybrid_search:
@@ -458,6 +503,7 @@ def search_faq(
         vector_docs=vector_docs,
         vector_candidates=vector_candidates,
         faq_store=faq_store,
+        principal=who,
     )
     # Stash debug on first doc for logging (chatbot can read if needed)
     if accepted:

@@ -8,9 +8,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from langchain_openai import ChatOpenAI
-
 from src.config import Settings
+from src.model_gateway import get_model_gateway
 
 logger = logging.getLogger(__name__)
 
@@ -249,10 +248,9 @@ def classify_intent(
         return IntentResult(ok=False, error="empty message")
 
     model = (settings.intent_model or settings.chat_model).strip() or settings.chat_model
-    llm = ChatOpenAI(
+    llm = get_model_gateway(settings).chat_llm(
+        purpose="intent",
         model=model,
-        openai_api_key=settings.dashscope_api_key,
-        openai_api_base=settings.openai_api_base,
         temperature=0,
     )
     human = f"用户消息：{text}"

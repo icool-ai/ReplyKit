@@ -34,12 +34,12 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
-from src.api_response import ApiResponse, ok, register_exception_handlers
+from src.api_response import ApiResponse, fail, ok, register_exception_handlers
 from src.agent_store import AgentStore
 from src.agents.competitor_routes import register_competitor_routes
 from src.asset_urls import paths_to_asset_urls
@@ -82,6 +82,7 @@ from src.channels.wecom import (
     wecom_configured,
 )
 from src.chat_log import ChatLogStore, log_turn_safe
+from src.chat_runs import ChatRunStore, ConcurrentChatRunError, RedisRequiredError
 from src.chatbot import CustomerServiceBot
 from src.config import Settings, get_settings
 from src.dify_retrieval import (
@@ -89,6 +90,8 @@ from src.dify_retrieval import (
     docs_to_records,
 )
 from src.skills.base import ChannelContext
+from src.session_locks import SessionLockRegistry
+from mp_agent.dao.redis_client import probe_redis_health
 from src.faq_import import (
     SUPPORTED_FORMATS,
     TEMPLATE_FORMATS,
@@ -150,8 +153,26 @@ class ChatData(BaseModel):
     strategy: str = ""
 
 
+class ChatRunCreatedData(BaseModel):
+    session_id: str
+    run_id: str
+
+
+class HealthRedisData(BaseModel):
+    configured: bool = False
+    ok: bool = False
+    latency_ms: float | None = None
+    error: str | None = None
+    chat_runs_backend: str = "memory"
+    chat_runs_require_redis: bool = False
+    memory_fallback_count: int = 0
+    last_memory_fallback_at: float | None = None
+    last_memory_fallback_reason: str | None = None
+
+
 class HealthData(BaseModel):
     status: str = "ok"
+    redis: HealthRedisData | None = None
 
 
 class LoginRequest(BaseModel):
@@ -211,6 +232,7 @@ class SessionDetailData(BaseModel):
     messages: list[dict[str, str]]
     updated_at: int
     created_at: int
+    active_run_id: str | None = None
 
 
 class SessionDeleteRequest(BaseModel):
@@ -319,6 +341,9 @@ class FaqItem(BaseModel):
     answer: str
     similar: list[str] = Field(default_factory=list)
     enabled: bool = True
+    owner_username: str = ""
+    visibility: str = "public"
+    allow_egress: bool = True
     created_at: int
     updated_at: int
 
@@ -330,6 +355,15 @@ class FaqCreateRequest(BaseModel):
     category: str = ""
     id: str | None = Field(default=None, description="可选自定义 ID")
     enabled: bool = True
+    owner_username: str = Field("", description="文档所有者；private 时仅本人+ops 可检索")
+    visibility: str = Field(
+        "public",
+        description="public=登录用户可见；private=仅 owner+ops",
+    )
+    allow_egress: bool = Field(
+        True,
+        description="False 时仅可本地直出，禁止送公网 rerank/LLM",
+    )
 
 
 class FaqListRequest(BaseModel):
@@ -361,6 +395,9 @@ class FaqUpdateRequest(BaseModel):
     similar: list[str] | None = None
     category: str | None = None
     enabled: bool | None = None
+    owner_username: str | None = None
+    visibility: str | None = None
+    allow_egress: bool | None = None
 
     @model_validator(mode="after")
     def _at_least_one_field(self) -> FaqUpdateRequest:
@@ -370,6 +407,9 @@ class FaqUpdateRequest(BaseModel):
             and self.similar is None
             and self.category is None
             and self.enabled is None
+            and self.owner_username is None
+            and self.visibility is None
+            and self.allow_egress is None
         ):
             raise ValueError("至少需要更新一个字段")
         return self
@@ -643,10 +683,13 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
         login_rate_limit=settings.login_rate_limit,
         login_rate_window_sec=settings.login_rate_window_sec,
     )
-    bot_lock = threading.Lock()
+    session_locks = SessionLockRegistry()
     faq_lock = threading.Lock()
     sensitive_lock = threading.Lock()
     channel_lock = threading.Lock()
+    chat_run_store = ChatRunStore(
+        require_redis=bool(settings.chat_runs_require_redis),
+    )
 
     def _empty_feishu(owner: str) -> dict[str, Any]:
         return FeishuChannelData(
@@ -688,7 +731,8 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             "运营 ops：/faqs*、/sensitive-words*、POST /bot-scripts*、/users*、"
             "POST /agents/list、POST /agents/{id}/update、"
             "GET/POST /integrations/dify/keys*。"
-            "POST /chat；GET /sessions；"
+            "POST /chat；POST /chat/runs + GET /chat/runs/{run_id}/stream（SSE 真流式）；"
+            "GET /sessions；"
             "POST /faqs、/faqs/list…；POST /users、/users/list、/users/update、/users/reset-password；"
             "GET /bot-scripts（登录可读）；POST /bot-scripts*（ops）；"
             "GET/POST /channels/feishu*（登录用户各自隔离；App ID 独占）；"
@@ -702,6 +746,7 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
         allow_origins=[
             "http://127.0.0.1:5173",
             "http://localhost:5173",
+            "http://192.168.0.182:5173",
         ],
         allow_credentials=True,
         allow_methods=["*"],
@@ -957,6 +1002,7 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
                 messages=list(owned.history),
                 updated_at=owned.updated_at,
                 created_at=owned.created_at,
+                active_run_id=chat_run_store.active_run_id(session_id),
             ).model_dump()
         )
 
@@ -971,8 +1017,47 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
         return ok(True, message="已删除")
 
     @app.get("/health", response_model=ApiResponse[HealthData])
-    def health() -> dict[str, Any]:
-        return ok(HealthData(status="ok").model_dump())
+    def health() -> Any:
+        redis_probe = probe_redis_health()
+        runs_obs = chat_run_store.observability()
+        redis_data = HealthRedisData(
+            configured=bool(redis_probe.get("configured")),
+            ok=bool(redis_probe.get("ok")),
+            latency_ms=(
+                float(redis_probe["latency_ms"])
+                if redis_probe.get("latency_ms") is not None
+                else None
+            ),
+            error=(
+                str(redis_probe["error"])
+                if redis_probe.get("error") is not None
+                else None
+            ),
+            chat_runs_backend=str(runs_obs.get("backend") or "memory"),
+            chat_runs_require_redis=bool(runs_obs.get("require_redis")),
+            memory_fallback_count=int(runs_obs.get("memory_fallback_count") or 0),
+            last_memory_fallback_at=(
+                float(runs_obs["last_memory_fallback_at"])
+                if runs_obs.get("last_memory_fallback_at") is not None
+                else None
+            ),
+            last_memory_fallback_reason=(
+                str(runs_obs["last_memory_fallback_reason"])
+                if runs_obs.get("last_memory_fallback_reason") is not None
+                else None
+            ),
+        )
+        # Configured but down → degraded (multi-replica SSE at risk).
+        degraded = bool(redis_data.configured and not redis_data.ok)
+        status = "degraded" if degraded else "ok"
+        payload = HealthData(status=status, redis=redis_data).model_dump()
+        if degraded and settings.health_redis_strict:
+            return fail(
+                code=503,
+                message="Redis unavailable",
+                data=payload,
+            )
+        return ok(payload)
 
     @app.post("/retrieval")
     async def dify_retrieval(
@@ -1087,7 +1172,16 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             )
 
         try:
-            docs, _cands, _route = search_faq(settings, query, k=top_k)
+            from src.acl import RetrievalPrincipal, filter_docs_for_egress
+
+            # External Dify: only public FAQs; never private owner docs.
+            docs, _cands, _route = search_faq(
+                settings,
+                query,
+                k=top_k,
+                principal=RetrievalPrincipal(username="", role="user"),
+            )
+            docs = filter_docs_for_egress(docs, default_allow=True)
             records = docs_to_records(
                 docs,
                 score_threshold=score_threshold,
@@ -1166,15 +1260,19 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             session_id = session_id_for_user(settings, incoming.from_user)
             try:
                 session = store.get(session_id)
-                with bot_lock:
-                    bot.load_session(session.bot_state)
-                    bot.channel_ctx = ChannelContext(channel="wecom")
+                with session_locks.hold(session_id):
+                    turn_bot = bot.fork_for_turn()
+                    turn_bot.load_session(session.bot_state)
+                    turn_bot.channel_ctx = ChannelContext(channel="wecom")
                     try:
-                        result = bot.chat_result(
-                            incoming.content, history=session.history
+                        result = turn_bot.chat_result(
+                            incoming.content,
+                            history=session.history,
+                            username=f"wecom:{incoming.from_user}",
+                            role="user",
                         )
                         display_user = (
-                            bot.last_effective_query or incoming.content
+                            turn_bot.last_effective_query or incoming.content
                         ).strip()
                         history = list(session.history) + [
                             {"role": "user", "content": display_user},
@@ -1183,7 +1281,7 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
                         store.save(
                             session_id,
                             history=history,
-                            bot_state=bot.dump_session(),
+                            bot_state=turn_bot.dump_session(),
                             username=f"wecom:{incoming.from_user}",
                         )
                         log_turn_safe(
@@ -1194,7 +1292,7 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
                             username=f"wecom:{incoming.from_user}",
                         )
                     finally:
-                        bot.channel_ctx = None
+                        turn_bot.channel_ctx = None
                 images = paths_to_asset_urls(
                     result.images,
                     settings.assets_dir,
@@ -1277,9 +1375,10 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
         username = f"feishu:{config_id}:{open_id or message_id}"
         try:
             session = store.get(session_id)
-            with bot_lock:
-                bot.load_session(session.bot_state)
-                bot.channel_ctx = ChannelContext(
+            with session_locks.hold(session_id):
+                turn_bot = bot.fork_for_turn()
+                turn_bot.load_session(session.bot_state)
+                turn_bot.channel_ctx = ChannelContext(
                     channel="feishu",
                     open_id=open_id,
                     feishu_config_id=config_id,
@@ -1288,8 +1387,13 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
                     public_base=public_base,
                 )
                 try:
-                    result = bot.chat_result(text, history=session.history)
-                    display_user = (bot.last_effective_query or text).strip()
+                    result = turn_bot.chat_result(
+                        text,
+                        history=session.history,
+                        username=username,
+                        role="user",
+                    )
+                    display_user = (turn_bot.last_effective_query or text).strip()
                     history = list(session.history) + [
                         {"role": "user", "content": display_user},
                         {"role": "assistant", "content": result.answer},
@@ -1297,7 +1401,7 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
                     store.save(
                         session_id,
                         history=history,
-                        bot_state=bot.dump_session(),
+                        bot_state=turn_bot.dump_session(),
                         username=username,
                     )
                     log_turn_safe(
@@ -1308,7 +1412,7 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
                         username=username,
                     )
                 finally:
-                    bot.channel_ctx = None
+                    turn_bot.channel_ctx = None
             images = paths_to_asset_urls(
                 result.images,
                 settings.assets_dir,
@@ -1727,15 +1831,21 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             session_id = _new_session_id()
             session = store.get(session_id)
 
-        with bot_lock:
-            bot.load_session(session.bot_state)
-            bot.channel_ctx = ChannelContext(
+        with session_locks.hold(session_id):
+            turn_bot = bot.fork_for_turn()
+            turn_bot.load_session(session.bot_state)
+            turn_bot.channel_ctx = ChannelContext(
                 channel="web",
                 public_base=_public_base_url(request, settings),
             )
             try:
-                result = bot.chat_result(message, history=session.history)
-                display_user = (bot.last_effective_query or message).strip()
+                result = turn_bot.chat_result(
+                    message,
+                    history=session.history,
+                    username=username,
+                    role=str(user.get("role") or "user"),
+                )
+                display_user = (turn_bot.last_effective_query or message).strip()
                 history = list(session.history) + [
                     {"role": "user", "content": display_user},
                     {"role": "assistant", "content": result.answer},
@@ -1743,7 +1853,7 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
                 store.save(
                     session_id,
                     history=history,
-                    bot_state=bot.dump_session(),
+                    bot_state=turn_bot.dump_session(),
                     username=username,
                 )
                 log_turn_safe(
@@ -1754,7 +1864,7 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
                     username=username,
                 )
             finally:
-                bot.channel_ctx = None
+                turn_bot.channel_ctx = None
 
         images = paths_to_asset_urls(
             result.images,
@@ -1771,6 +1881,318 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
             strategy=result.strategy,
         )
         return ok(data.model_dump())
+
+    def _resolve_owned_session(
+        raw_sid: str,
+        username: str,
+    ) -> tuple[str, Any]:
+        """Return (session_id, session) with ownership checks matching POST /chat."""
+        if raw_sid:
+            owned = store.get_for_user(raw_sid, username)
+            if owned is None:
+                existing = store.get(raw_sid)
+                if existing.username and existing.username != username:
+                    raise HTTPException(status_code=403, detail="无权使用该会话")
+                if existing.username is None and existing.history:
+                    raise HTTPException(status_code=403, detail="无权使用该会话")
+                return raw_sid, existing
+            return raw_sid, owned
+        session_id = _new_session_id()
+        return session_id, store.get(session_id)
+
+    def _persist_failed_assistant(
+        session_id: str,
+        *,
+        username: str,
+        user_message: str,
+        error_text: str,
+        partial_answer: str = "",
+    ) -> str:
+        """Ensure failed runs leave an assistant bubble (not user-only)."""
+        safe = (error_text or "生成失败，请稍后重试。").strip()
+        if len(safe) > 500:
+            safe = safe[:500] + "…"
+        partial = (partial_answer or "").strip()
+        if partial:
+            assistant = f"{partial}\n\n错误：{safe}"
+        else:
+            assistant = f"错误：{safe}"
+        try:
+            session = store.get(session_id)
+            hist = list(session.history)
+            if hist and hist[-1].get("role") == "assistant":
+                # Already has assistant (e.g. duplicate failure) — replace last.
+                hist[-1] = {"role": "assistant", "content": assistant}
+            elif hist and hist[-1].get("role") == "user":
+                hist.append({"role": "assistant", "content": assistant})
+            else:
+                hist.append({"role": "user", "content": user_message})
+                hist.append({"role": "assistant", "content": assistant})
+            store.save(
+                session_id,
+                history=hist,
+                bot_state=session.bot_state,
+                username=username,
+                title=session.title or None,
+            )
+        except Exception:  # noqa: BLE001 — failure path must not raise
+            logging.getLogger(__name__).exception(
+                "persist failed assistant session_id=%s", session_id
+            )
+        return assistant
+
+    def _execute_chat_run(run_id: str) -> None:
+        """Background worker: generate answer, persist, emit SSE events (B)."""
+        run = chat_run_store.get(run_id)
+        if run is None:
+            return
+        session_id = run.session_id
+        username = run.username
+        message = run.message
+        result = None
+        try:
+            run.append("status", phase="thinking")
+
+            def on_status(phase: str) -> None:
+                run.append("status", phase=phase)
+
+            def on_delta(text: str) -> None:
+                if text:
+                    run.append("delta", text=text)
+
+            with session_locks.hold(session_id):
+                session = store.get(session_id)
+                turn_bot = bot.fork_for_turn()
+                turn_bot.load_session(session.bot_state)
+                turn_bot.channel_ctx = ChannelContext(
+                    channel="web",
+                    public_base=run.public_base_url,
+                )
+                run_role = "user"
+                try:
+                    from mp_agent.dao.models import User
+                    from sqlalchemy.orm import Session as SaSession
+                    from mp_agent.dao.sync_db import sync_engine
+
+                    with SaSession(sync_engine) as db:
+                        db_user = db.get(User, username)
+                        if db_user is not None:
+                            run_role = str(db_user.role or "user")
+                except Exception:  # noqa: BLE001
+                    run_role = "user"
+                try:
+                    # 创建 run 时已追加本轮 user，喂给 bot 时去掉末条避免重复。
+                    hist_for_bot = list(session.history)
+                    if (
+                        hist_for_bot
+                        and hist_for_bot[-1].get("role") == "user"
+                        and hist_for_bot[-1].get("content") == message
+                    ):
+                        hist_for_bot = hist_for_bot[:-1]
+                    result = turn_bot.chat_result(
+                        message,
+                        history=hist_for_bot,
+                        on_status=on_status,
+                        on_delta=on_delta,
+                        username=username,
+                        role=run_role,
+                    )
+                    display_user = (turn_bot.last_effective_query or message).strip()
+                    # 创建 run 时已写入原始 user；此处用有效问句替换末条 user，再追加 assistant。
+                    hist = list(session.history)
+                    if (
+                        hist
+                        and hist[-1].get("role") == "user"
+                        and hist[-1].get("content") == message
+                    ):
+                        hist[-1] = {"role": "user", "content": display_user}
+                    elif not (
+                        hist
+                        and hist[-1].get("role") == "user"
+                        and hist[-1].get("content") == display_user
+                    ):
+                        hist.append({"role": "user", "content": display_user})
+                    hist.append({"role": "assistant", "content": result.answer})
+                    store.save(
+                        session_id,
+                        history=hist,
+                        bot_state=turn_bot.dump_session(),
+                        username=username,
+                    )
+                    log_turn_safe(
+                        chat_logs,
+                        session_id=session_id,
+                        question=display_user,
+                        result=result,
+                        username=username,
+                    )
+                finally:
+                    turn_bot.channel_ctx = None
+
+            if not run.delta_emitted:
+                run.append("status", phase="generating")
+                run.append("delta", text=result.answer)
+
+            images = paths_to_asset_urls(
+                result.images,
+                settings.assets_dir,
+                base_url=run.public_base_url,
+            )
+            run.append(
+                "meta",
+                sources=list(result.sources),
+                images=images,
+                clarify_options=list(result.clarify_options),
+                route=result.route,
+                strategy=result.strategy,
+            )
+            run.append("done", session_id=session_id)
+        except Exception as exc:  # noqa: BLE001 — must always terminate SSE
+            logging.getLogger(__name__).exception(
+                "chat run failed run_id=%s session_id=%s", run_id, session_id
+            )
+            err_msg = str(exc) or "生成失败，请稍后重试"
+            partial = "".join(
+                str(e.get("text") or "")
+                for e in run.events_after(0)
+                if e.get("type") == "delta"
+            )
+            _persist_failed_assistant(
+                session_id,
+                username=username,
+                user_message=message,
+                error_text=err_msg,
+                partial_answer=partial,
+            )
+            run.append("error", message=err_msg)
+            run.append("done", session_id=session_id)
+        finally:
+            chat_run_store.finish_active(session_id, run_id)
+
+    @app.post("/chat/runs", response_model=ApiResponse[ChatRunCreatedData])
+    def create_chat_run(
+        req: ChatRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(require_auth),
+    ) -> dict[str, Any]:
+        message = req.message.strip()
+        if not message:
+            raise HTTPException(status_code=422, detail="message 不能为空")
+
+        username = str(user["sub"])
+        raw_sid = (req.session_id or "").strip()
+        session_id, _session = _resolve_owned_session(raw_sid, username)
+        # Ensure session row exists for new ids before background save.
+        if not raw_sid:
+            store.save(
+                session_id,
+                history=[],
+                bot_state={},
+                username=username,
+            )
+
+        try:
+            run = chat_run_store.create(
+                session_id=session_id,
+                username=username,
+                message=message,
+                public_base_url=_public_base_url(request, settings),
+            )
+        except ConcurrentChatRunError:
+            raise HTTPException(
+                status_code=409,
+                detail="当前会话已有进行中的回复",
+            ) from None
+        except RedisRequiredError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=str(exc) or "Redis 不可用，无法创建流式回复",
+            ) from None
+
+        # B: 先落用户消息，离开后再进会话仍能看到提问；助手在 run 成功后追加。
+        session = store.get(session_id)
+        store.save(
+            session_id,
+            history=list(session.history) + [{"role": "user", "content": message}],
+            bot_state=session.bot_state,
+            username=username,
+            title=session.title or None,
+        )
+
+        threading.Thread(
+            target=_execute_chat_run,
+            args=(run.run_id,),
+            name=f"chat-run-{run.run_id[:8]}",
+            daemon=True,
+        ).start()
+
+        return ok(
+            ChatRunCreatedData(
+                session_id=session_id,
+                run_id=run.run_id,
+            ).model_dump()
+        )
+
+    @app.get("/chat/runs/{run_id}/stream")
+    async def stream_chat_run(
+        run_id: str,
+        request: Request,
+        after: int | None = Query(
+            default=None,
+            ge=0,
+            description="续读游标；优先使用 Last-Event-ID",
+        ),
+        user: dict[str, Any] = Depends(require_auth),
+    ) -> StreamingResponse:
+        import asyncio
+        import time as time_mod
+
+        run = chat_run_store.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run 不存在或已过期")
+        if run.username != str(user["sub"]):
+            raise HTTPException(status_code=403, detail="无权订阅该回复")
+
+        last_header = (request.headers.get("last-event-id") or "").strip()
+        cursor = 0
+        if last_header.isdigit():
+            cursor = int(last_header)
+        elif after is not None:
+            cursor = after
+
+        async def event_stream():
+            nonlocal cursor
+            last_ping = time_mod.monotonic()
+            while True:
+                if await request.is_disconnected():
+                    break
+                batch = run.events_after(cursor)
+                if batch:
+                    for event in batch:
+                        cursor = int(event["id"])
+                        payload = json.dumps(event, ensure_ascii=False)
+                        yield f"id: {cursor}\ndata: {payload}\n\n"
+                        if event.get("type") == "done":
+                            return
+                    last_ping = time_mod.monotonic()
+                    continue
+                if run.snapshot_done():
+                    return
+                now = time_mod.monotonic()
+                if now - last_ping >= 15.0:
+                    yield ": ping\n\n"
+                    last_ping = now
+                await asyncio.sleep(0.05)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     # ---- FAQ management (P3-3): all POST ----
 
@@ -1821,6 +2243,9 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
                     category=req.category,
                     faq_id=req.id,
                     enabled=req.enabled,
+                    owner_username=req.owner_username,
+                    visibility=req.visibility,
+                    allow_egress=req.allow_egress,
                 )
                 faq_id = row.id
         except LookupError as exc:
@@ -1845,6 +2270,9 @@ def create_api_app(settings: Settings | None = None) -> FastAPI:
                     similar=req.similar,
                     category=req.category,
                     enabled=req.enabled,
+                    owner_username=req.owner_username,
+                    visibility=req.visibility,
+                    allow_egress=req.allow_egress,
                 )
                 faq_id = row.id
         except KeyError as exc:

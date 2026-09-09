@@ -29,6 +29,9 @@ class Settings:
     assets_dir: Path
     asset_base_url: str
     jwt_secret: str
+    # 落库密钥：AES-GCM 主密钥（urlsafe base64 的 32 字节）；API Key HMAC pepper 可选
+    secrets_master_key: str
+    api_key_pepper: str
     jwt_access_ttl: int
     jwt_refresh_ttl: int
     admin_username: str
@@ -77,10 +80,19 @@ class Settings:
     login_rate_limit: int
     login_rate_window_sec: int
     session_cache_ttl: int
+    # Multi-replica: refuse chat-run memory fallback when Redis is required.
+    chat_runs_require_redis: bool
+    # /health returns HTTP 503 when Redis is configured but unreachable.
+    health_redis_strict: bool
     # --- Apache Tika (optional: universal document parser, graceful downgrade) ---
     tika_enabled: bool
     tika_url: str
     tika_timeout_sec: int
+    # --- FAQ ACL + model egress (private KB, public model APIs) ---
+    faq_acl_enabled: bool
+    model_egress_redact_pii: bool
+    model_egress_max_chunk_chars: int
+    model_egress_max_rerank_docs: int
 
     @property
     def score_threshold(self) -> float:
@@ -114,6 +126,22 @@ class Settings:
                 "未配置有效的 JWT_SECRET（至少 32 字符）。"
                 "请复制 .env.example 为 .env 并填入。"
             )
+        secrets_master_key = os.getenv("SECRETS_MASTER_KEY", "").strip()
+        if not secrets_master_key:
+            raise ValueError(
+                "未配置 SECRETS_MASTER_KEY（32 字节，推荐 urlsafe base64）。"
+                "请复制 .env.example 为 .env 并生成："
+                "python -c \"import secrets,base64; "
+                "print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())\""
+            )
+        # 启动时校验可解析，避免运行到半路才失败
+        from src.secrets_crypto import SecretsCryptoError, parse_master_key
+
+        try:
+            parse_master_key(secrets_master_key)
+        except SecretsCryptoError as exc:
+            raise ValueError(str(exc)) from exc
+        api_key_pepper = os.getenv("API_KEY_PEPPER", "").strip()
         admin_username = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
         admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
         if not admin_password:
@@ -205,6 +233,8 @@ class Settings:
             assets_dir=assets_dir,
             asset_base_url=asset_base_url,
             jwt_secret=jwt_secret,
+            secrets_master_key=secrets_master_key,
+            api_key_pepper=api_key_pepper,
             jwt_access_ttl=jwt_access_ttl,
             jwt_refresh_ttl=jwt_refresh_ttl,
             admin_username=admin_username,
@@ -258,6 +288,14 @@ class Settings:
             login_rate_limit=int(os.getenv("LOGIN_RATE_LIMIT", "5")),
             login_rate_window_sec=int(os.getenv("LOGIN_RATE_WINDOW_SEC", "300")),
             session_cache_ttl=int(os.getenv("SESSION_CACHE_TTL", "1800")),
+            chat_runs_require_redis=os.getenv(
+                "CHAT_RUNS_REQUIRE_REDIS", "false"
+            ).strip().lower()
+            in {"1", "true", "yes", "on"},
+            health_redis_strict=os.getenv(
+                "HEALTH_REDIS_STRICT", "false"
+            ).strip().lower()
+            in {"1", "true", "yes", "on"},
             tika_enabled=os.getenv("TIKA_ENABLED", "true").strip().lower()
             in {"1", "true", "yes", "on"},
             tika_url=os.getenv(
@@ -265,6 +303,18 @@ class Settings:
                 "http://127.0.0.1:9998/tika",
             ).strip(),
             tika_timeout_sec=int(os.getenv("TIKA_TIMEOUT_SEC", "60")),
+            faq_acl_enabled=os.getenv("FAQ_ACL_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes", "on"},
+            model_egress_redact_pii=os.getenv(
+                "MODEL_EGRESS_REDACT_PII", "true"
+            ).strip().lower()
+            in {"1", "true", "yes", "on"},
+            model_egress_max_chunk_chars=int(
+                os.getenv("MODEL_EGRESS_MAX_CHUNK_CHARS", "4000")
+            ),
+            model_egress_max_rerank_docs=int(
+                os.getenv("MODEL_EGRESS_MAX_RERANK_DOCS", "50")
+            ),
         )
 
 

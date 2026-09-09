@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { listEnabledAgents, type AgentItem } from '@/api/agents'
 import { getBotScripts } from '@/api/botScripts'
-import { postChat } from '@/api/chat'
+import { createChatRun, streamChatRun, type ChatStreamEvent } from '@/api/chat'
 import { ApiError } from '@/api/client'
 import {
   createCompetitorSession,
@@ -22,6 +22,9 @@ interface Bubble {
   clarifyOptions?: string[]
   downloadUrl?: string
   downloadName?: string
+  /** 本地 UI：thinking / generating / reconnecting */
+  statusPhase?: string
+  streaming?: boolean
 }
 
 const AGENT_KEY = 'replykit_active_agent'
@@ -47,6 +50,14 @@ const activeAgentName = computed(() => {
   const a = agents.value.find((x) => x.id === activeAgentId.value)
   return a?.name || (isCompetitor.value ? '电商竞品分析' : '智能客服')
 })
+
+/** 取消当前客服 SSE（切会话 / 新会话时） */
+let streamAbort: AbortController | null = null
+
+function abortCustomerStream() {
+  streamAbort?.abort()
+  streamAbort = null
+}
 
 async function scrollBottom() {
   await nextTick()
@@ -143,6 +154,7 @@ async function loadHistory() {
 async function openSession(item: SessionSummary) {
   if (isCompetitor.value) return
   const epoch = ++viewEpoch
+  abortCustomerStream()
   try {
     const detail = await getSession(item.session_id)
     if (epoch !== viewEpoch) return
@@ -152,6 +164,24 @@ async function openSession(item: SessionSummary) {
       content: m.content,
     }))
     await scrollBottom()
+    // B: 仍有进行中的 run 且助手尚未落库 → 重新挂 SSE
+    const lastMsg = detail.messages[detail.messages.length - 1]
+    if (detail.active_run_id && lastMsg?.role === 'user') {
+      loading.value = true
+      messages.value.push({
+        role: 'assistant',
+        content: '',
+        statusPhase: 'pending',
+        streaming: true,
+      })
+      await scrollBottom()
+      try {
+        await attachCustomerStream(detail.active_run_id, epoch)
+        await loadHistory()
+      } finally {
+        if (epoch === viewEpoch) loading.value = false
+      }
+    }
   } catch (err) {
     if (epoch !== viewEpoch) return
     ElMessage.error(err instanceof ApiError ? err.message : '打开会话失败')
@@ -172,15 +202,113 @@ async function removeSession(item: SessionSummary, e: Event) {
   }
 }
 
+function applyCustomerStreamEvent(ev: ChatStreamEvent, bubbleIndex: number) {
+  const bubble = messages.value[bubbleIndex]
+  if (!bubble || bubble.role !== 'assistant') return
+
+  if (ev.type === 'status') {
+    const phase = typeof ev.phase === 'string' ? ev.phase : ''
+    if (phase === 'reconnecting') {
+      bubble.statusPhase = 'reconnecting'
+      return
+    }
+    // pending → thinking → generating；未出字前保留阶段文案
+    if (!bubble.content) {
+      if (phase === 'thinking' || phase === 'generating') {
+        bubble.statusPhase = phase
+      } else if (phase) {
+        bubble.statusPhase = phase
+      }
+    }
+    return
+  }
+  if (ev.type === 'delta' && typeof ev.text === 'string') {
+    bubble.streaming = true
+    bubble.statusPhase = undefined
+    bubble.content += ev.text
+    void scrollBottom()
+    return
+  }
+  if (ev.type === 'meta') {
+    if (Array.isArray(ev.images)) bubble.images = ev.images as string[]
+    if (Array.isArray(ev.clarify_options)) {
+      bubble.clarifyOptions = ev.clarify_options as string[]
+    }
+    return
+  }
+  if (ev.type === 'error') {
+    bubble.statusPhase = undefined
+    bubble.streaming = false
+    const msg = typeof ev.message === 'string' ? ev.message : '生成失败'
+    bubble.content = bubble.content ? `${bubble.content}\n\n错误：${msg}` : `错误：${msg}`
+    return
+  }
+  if (ev.type === 'done') {
+    bubble.statusPhase = undefined
+    bubble.streaming = false
+  }
+}
+
+async function attachCustomerStream(runId: string, epoch: number) {
+  abortCustomerStream()
+  const ac = new AbortController()
+  streamAbort = ac
+  const bubbleIndex = messages.value.length - 1
+
+  try {
+    await streamChatRun(
+      runId,
+      (ev) => {
+        if (epoch !== viewEpoch) return
+        applyCustomerStreamEvent(ev, bubbleIndex)
+      },
+      ac.signal,
+    )
+  } catch (err) {
+    if (ac.signal.aborted || epoch !== viewEpoch) return
+    const status = (err as { status?: number }).status
+    // run 已过期：尝试用会话 history 回填（B）
+    if ((status === 404 || status === 410) && sessionId.value) {
+      try {
+        const detail = await getSession(sessionId.value)
+        if (epoch !== viewEpoch) return
+        const hist = detail.messages
+        if (hist.length) {
+          messages.value = hist.map((m) => ({
+            role: m.role === 'user' ? 'user' : 'assistant',
+            content: m.content,
+          }))
+          return
+        }
+      } catch {
+        /* fall through */
+      }
+    }
+    const msg =
+      err instanceof ApiError
+        ? err.message
+        : err instanceof Error
+          ? err.message
+          : '流式连接失败'
+    applyCustomerStreamEvent({ type: 'error', message: msg }, bubbleIndex)
+  } finally {
+    if (streamAbort === ac) streamAbort = null
+  }
+}
+
 async function sendCustomer(message: string) {
-  const data = await postChat(message, sessionId.value)
-  sessionId.value = data.session_id
+  const epoch = viewEpoch
+  const run = await createChatRun(message, sessionId.value)
+  if (epoch !== viewEpoch) return
+  sessionId.value = run.session_id
   messages.value.push({
     role: 'assistant',
-    content: data.answer,
-    images: data.images,
-    clarifyOptions: data.clarify_options,
+    content: '',
+    statusPhase: 'pending',
+    streaming: true,
   })
+  await scrollBottom()
+  await attachCustomerStream(run.run_id, epoch)
   await loadHistory()
 }
 
@@ -261,9 +389,11 @@ function onClarify(option: string) {
 }
 
 async function resetSession(notify = true) {
+  abortCustomerStream()
   sessionId.value = null
   welcomeText.value = ''
   messages.value = []
+  loading.value = false
   await showWelcome()
   if (notify) ElMessage.success('已开启新会话')
 }
@@ -363,7 +493,39 @@ onMounted(async () => {
         </div>
         <div v-for="(m, i) in messages" :key="i" class="row" :class="m.role">
           <div class="bubble">
-            <div class="text">{{ m.content }}</div>
+            <!-- 思考前：动态三点 -->
+            <div
+              v-if="m.streaming && !m.content && (!m.statusPhase || m.statusPhase === 'pending')"
+              class="status-dots"
+              aria-label="等待中"
+            >
+              <span /><span /><span />
+            </div>
+            <!-- 模型思考中 -->
+            <div
+              v-else-if="m.streaming && !m.content && m.statusPhase === 'thinking'"
+              class="status-thinking"
+            >
+              <span class="status-thinking-label">思考中</span>
+              <span class="status-dots inline" aria-hidden="true">
+                <span /><span /><span />
+              </span>
+            </div>
+            <div
+              v-else-if="m.streaming && !m.content && m.statusPhase === 'reconnecting'"
+              class="status-line"
+            >
+              连接恢复中…
+            </div>
+            <!-- generating 尚无首字：继续三点 -->
+            <div
+              v-else-if="m.streaming && !m.content"
+              class="status-dots"
+              aria-label="生成中"
+            >
+              <span /><span /><span />
+            </div>
+            <div v-else class="text">{{ m.content }}<span v-if="m.streaming" class="caret" /></div>
             <div v-if="m.downloadUrl" class="dl">
               <el-button
                 size="small"
@@ -589,6 +751,79 @@ onMounted(async () => {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 10px;
+}
+
+.status-line {
+  color: #909399;
+  font-size: 13px;
+}
+
+.status-thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #606266;
+  font-size: 13px;
+}
+
+.status-thinking-label {
+  letter-spacing: 0.02em;
+}
+
+.status-dots {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  min-height: 1.2em;
+}
+
+.status-dots.inline {
+  min-height: 0;
+}
+
+.status-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #c0c4cc;
+  animation: status-bounce 1.2s infinite ease-in-out;
+}
+
+.status-dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.status-dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes status-bounce {
+  0%,
+  80%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+.caret {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 1px;
+  background: #409eff;
+  vertical-align: text-bottom;
+  animation: caret-blink 1s step-end infinite;
+}
+
+@keyframes caret-blink {
+  50% {
+    opacity: 0;
+  }
 }
 
 .composer {

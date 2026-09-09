@@ -121,6 +121,69 @@ def get_redis_client() -> object | None:
         return client
 
 
+def invalidate_redis_client(*, reason: str = "") -> None:
+    """Drop the cached client so the next call re-connects."""
+    global _global_client, _last_connect_fail_ts
+    with _global_init_lock:
+        _global_client = None
+        _last_connect_fail_ts = time.time()
+    if reason:
+        _logger.warning("Redis client invalidated: %s", reason)
+
+
+def redis_is_configured() -> bool:
+    """True when REDIS_ENABLED and REDIS_URL resolve to a target."""
+    return _build_redis_url() is not None
+
+
+def probe_redis_health() -> dict[str, object | None]:
+    """Live Redis connectivity probe for /health and ops monitors.
+
+    Returns::
+        {
+          "configured": bool,
+          "ok": bool,
+          "latency_ms": float | None,
+          "error": str | None,
+        }
+    """
+    if not redis_is_configured():
+        return {
+            "configured": False,
+            "ok": False,
+            "latency_ms": None,
+            "error": None,
+        }
+
+    client = get_redis_client()
+    if client is None:
+        return {
+            "configured": True,
+            "ok": False,
+            "latency_ms": None,
+            "error": "connect_failed_or_backoff",
+        }
+
+    try:
+        t0 = time.perf_counter()
+        client.ping()  # type: ignore[attr-defined]
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return {
+            "configured": True,
+            "ok": True,
+            "latency_ms": latency_ms,
+            "error": None,
+        }
+    except Exception as exc:  # noqa: BLE001 — health must never raise
+        invalidate_redis_client(reason=f"ping failed: {exc}")
+        return {
+            "configured": True,
+            "ok": False,
+            "latency_ms": None,
+            "error": str(exc) or "ping_failed",
+        }
+
+
 @contextmanager
 def get_redis() -> Iterator[object | None]:
     """Context manager yielding the Redis client or None.
